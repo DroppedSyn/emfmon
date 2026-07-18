@@ -49,7 +49,7 @@ NAME_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 # Pet size grows with age: a tiny dot at age 0, full size by PET_GROW_AGE hours.
 PET_MIN_SIZE = 1.5
 PET_MAX_SIZE = 16.0
-PET_GROW_AGE = 10
+GROW_MS = 1800_000  # running-time to grow from a tiny dot to full size (30 min)
 
 # Action feedback animation length (ms).
 ANIM_MS = 800
@@ -81,6 +81,7 @@ def _new_pet():
         "shape": random.choice(SHAPES),
         "colour": _random_colour(),
         "age": 0,          # whole hours survived
+        "grow_ms": 0.0,    # running-time accumulated toward full size (GROW_MS)
         "health": 100.0,
         "food": 100.0,
         "fun": 100.0,
@@ -185,6 +186,9 @@ class EMFMon(app.App):
         # it, and only when a need is below LOW.
         for stat, mins in MINUTES_TO_EMPTY.items():
             pet[stat] = max(0.0, pet[stat] - delta * 100.0 / (mins * 60_000.0))
+
+        # grow from a tiny dot to full size over GROW_MS of running time
+        pet["grow_ms"] = min(GROW_MS, pet.get("grow_ms", 0.0) + delta)
 
         self._update_notifications()
 
@@ -392,8 +396,8 @@ class EMFMon(app.App):
 
     def _draw_pet(self, ctx):
         r, g, b = self.pet["colour"]
-        # size grows with age: a tiny dot at 0, full size by PET_GROW_AGE
-        grow = min(self.pet["age"], PET_GROW_AGE) / PET_GROW_AGE
+        # size grows over real running time: tiny dot -> full size in GROW_MS
+        grow = min(1.0, self.pet.get("grow_ms", 0.0) / GROW_MS)
         s = PET_MIN_SIZE + (PET_MAX_SIZE - PET_MIN_SIZE) * grow
         x, y = self._x, self._y
         ctx.rgb(r, g, b)
