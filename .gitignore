@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# local-install artifacts (the store uses tildagon.toml)
+metadata.json
+tildagon.json
+state.json
+history.json

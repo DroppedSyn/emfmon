@@ -1,0 +1,13 @@
+[app]
+name = "EMFMon"
+category = "Games"
+
+[entry]
+class = "EMFMon"
+
+[metadata]
+author = "DroppedSyn"
+license = "MIT"
+url = "https://github.com/DroppedSyn/emfmon"
+description = "A Tamagotchi-style pet for your badge - feed, play, clean and heal it, or it might not make it."
+version = "1.0.0"
