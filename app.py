@@ -55,6 +55,7 @@ ANIM_MS = 800
 
 # Movement bounds - kept clear of the name/Food labels above and the bars below.
 MOVE_CX, MOVE_CY, MOVE_R = 0, -10, 46
+MOVE_SPEED = 0.014  # px per ms of wander speed (lower = slower, gentler)
 
 try:
     _DIR = __file__.rsplit("/", 1)[0]
@@ -129,7 +130,8 @@ class EMFMon(app.App):
         # Pet position/velocity for the wandering animation.
         self._x, self._y = MOVE_CX, MOVE_CY
         ang = random.random() * 2 * math.pi
-        self._vx, self._vy = math.cos(ang) * 0.04, math.sin(ang) * 0.04
+        self._vx = math.cos(ang) * MOVE_SPEED
+        self._vy = math.sin(ang) * MOVE_SPEED
         eventbus.on(ButtonDownEvent, self._on_button, self)
 
     # --- persistence -------------------------------------------------------
@@ -353,9 +355,13 @@ class EMFMon(app.App):
             self._vy -= 2 * dot * ny
             self._x = MOVE_CX + nx * MOVE_R
             self._y = MOVE_CY + ny * MOVE_R
-            # a little wobble so it doesn't get stuck in a loop
-            self._vx += (random.random() - 0.5) * 0.01
-            self._vy += (random.random() - 0.5) * 0.01
+            # a little wobble so it doesn't get stuck in a loop, then
+            # renormalise so the wander speed stays constant (no drift)
+            self._vx += (random.random() - 0.5) * 0.008
+            self._vy += (random.random() - 0.5) * 0.008
+            mag = math.sqrt(self._vx * self._vx + self._vy * self._vy) or 1
+            self._vx = self._vx / mag * MOVE_SPEED
+            self._vy = self._vy / mag * MOVE_SPEED
 
     # --- drawing -----------------------------------------------------------
     def draw(self, ctx):
