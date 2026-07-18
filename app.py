@@ -28,19 +28,19 @@ from system.scheduler import scheduler
 # HOUR_MS governs age/health/death only (the "hourly" tick). Needs decay on
 # their own real-time schedule below, so changing HOUR_MS does NOT change how
 # fast the pet gets hungry.
-HOUR_MS = 3600_000  # one "hour" of pet time = one real hour (age & health)
+HOUR_MS = 3600_000  # one "hour" of pet time = one real hour (age only)
 DEATH_MS = 1200_000  # a death roll is made this often (every 20 minutes)
+HEALTH_TICK_MS = 1800_000  # health is adjusted this often (every 30 minutes)
 # How long (real minutes) each need takes to fall from full (100) to empty (0).
 # Real-time and independent of HOUR_MS -> food gets hungry in ~10 min at any
 # speed. Health is NOT in here: it only moves on the hourly tick.
 MINUTES_TO_EMPTY = {"food": 10.0, "fun": 15.0, "clean": 20.0}
-LOW = 10.0           # "critical" - hurts health on the hourly tick
-RED_AT = 25.0        # a bar shows red below this (earlier visual warning)
+RED_AT = 25.0        # a need below this shows red AND hurts health (25%)
 NOTIFY_AT = 20.0     # send a "!" notification when a need drops below this
 ACTION_GAIN = {"food": 35.0, "fun": 35.0, "clean": 40.0, "injection": 30.0}
-HEALTH_HURT = 12.0   # health lost per hour per critical stat
-HEALTH_HEAL = 6.0    # health regained per hour when well cared for
-HEALTH_RISK = 20.0   # below this, death is rolled each hour
+HEALTH_DROP = 10.0   # health lost each health tick when any need is below RED_AT
+HEALTH_HEAL = 6.0    # health regained each health tick when well cared for
+HEALTH_RISK = 20.0   # below this health, death is rolled (every DEATH_MS)
 DEATH_CHANCE = 0.1   # 1-in-10 each death roll when at risk ("let's not be mean")
 
 SHAPES = ("square", "triangle")
@@ -124,6 +124,7 @@ class EMFMon(app.App):
         self._anim_type = None     # current action animation type, or None
         self._anim_t = 0.0         # ms elapsed in the current animation
         self._hour_acc = 0.0       # ms accumulated toward the next hour tick
+        self._health_acc = 0.0     # ms accumulated toward the next health tick
         self._death_acc = 0.0      # ms accumulated toward the next death roll
         self._save_acc = 0.0       # ms accumulated toward the next autosave
         # Always-on-top "!" indicator shown on the home screen (and over any
@@ -182,8 +183,7 @@ class EMFMon(app.App):
 
         # Needs decay on a real-time schedule (MINUTES_TO_EMPTY), independent of
         # the HOUR_MS tick, so food empties in ~10 real minutes at any speed.
-        # Health is deliberately NOT decayed here - only the hourly tick lowers
-        # it, and only when a need is below LOW.
+        # Health is not touched here - it changes on the health tick below.
         for stat, mins in MINUTES_TO_EMPTY.items():
             pet[stat] = max(0.0, pet[stat] - delta * 100.0 / (mins * 60_000.0))
 
@@ -196,6 +196,12 @@ class EMFMon(app.App):
         while self._hour_acc >= HOUR_MS:
             self._hour_acc -= HOUR_MS
             self._hourly_tick()
+
+        # Health tick (every HEALTH_TICK_MS = 30 min): -10% if any need is red.
+        self._health_acc += delta
+        while self._health_acc >= HEALTH_TICK_MS:
+            self._health_acc -= HEALTH_TICK_MS
+            self._health_tick()
 
         # Death roll on its own faster cadence (every DEATH_MS = 20 min).
         self._death_acc += delta
@@ -211,12 +217,14 @@ class EMFMon(app.App):
             self._save_state()
 
     def _hourly_tick(self):
-        pet = self.pet
-        pet["age"] += 1
+        self.pet["age"] += 1
 
-        criticals = sum(1 for s in ("food", "fun", "clean") if pet[s] < LOW)
-        if criticals:
-            pet["health"] = max(0.0, pet["health"] - HEALTH_HURT * criticals)
+    def _health_tick(self):
+        # Every HEALTH_TICK_MS (30 min): lose HEALTH_DROP if any need is in the
+        # red (below RED_AT), otherwise slowly recover when well cared for.
+        pet = self.pet
+        if any(pet[s] < RED_AT for s in ("food", "fun", "clean")):
+            pet["health"] = max(0.0, pet["health"] - HEALTH_DROP)
         elif pet["food"] >= 50 and pet["fun"] >= 50 and pet["clean"] >= 50:
             pet["health"] = min(100.0, pet["health"] + HEALTH_HEAL)
 
