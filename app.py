@@ -46,7 +46,7 @@ DEATH_CHANCE = 0.1   # 1-in-10 each death roll when at risk ("let's not be mean"
 SHAPES = ("square", "triangle")
 NAME_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-# Pet size grows with age: a tiny dot at age 0, full size by PET_GROW_AGE hours.
+# Pet size grows over real running time: a tiny dot at first, full size at GROW_MS.
 PET_MIN_SIZE = 1.5
 PET_MAX_SIZE = 16.0
 GROW_MS = 1800_000  # running-time to grow from a tiny dot to full size (30 min)
@@ -526,16 +526,16 @@ class EMFMon(app.App):
     def _draw_bars(self, ctx):
         ctx.text_align = ctx.LEFT
         ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 12
+        ctx.font_size = 11
         rows = (
             ("HP", self.pet["health"]),
-            ("Fd", self.pet["food"]),
-            ("Fn", self.pet["fun"]),
-            ("Cl", self.pet["clean"]),
+            ("Food", self.pet["food"]),
+            ("Fun", self.pet["fun"]),
+            ("Clean", self.pet["clean"]),
         )
-        bw, bh = 56, 7          # smaller bars
-        lx = -50                # label x (a bit left of centre)
-        x0 = -28                # bar x
+        bw, bh = 44, 7          # bar size (shorter, to leave room for words)
+        lx = -60                # label x (full words, left-aligned)
+        x0 = -22                # bar x
         y0 = 56
         for i, (label, val) in enumerate(rows):
             y = y0 + i * 12
