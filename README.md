@@ -2,9 +2,10 @@
 
 A Tamagotchi-style virtual pet for the [EMF Tildagon badge](https://tildagon.badge.emfcamp.org/).
 
-Your pet is a randomly-coloured square or triangle with a little face. It wanders
-the screen and has four needs — **Health, Food, Fun, Clean** — that slowly drain
-over real time. Keep it fed, entertained, clean and healthy, or it might not make it.
+Your pet is a randomly-coloured square or triangle with a little face. It hatches
+as a tiny dot and **grows with your badge over time**, wandering the screen while
+four needs — **Health, Food, Fun, Clean** — slowly drain. Keep it fed, entertained,
+clean and healthy, or it might not make it.
 
 ## Controls
 
