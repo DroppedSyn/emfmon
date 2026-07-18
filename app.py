@@ -28,7 +28,8 @@ from system.scheduler import scheduler
 # HOUR_MS governs age/health/death only (the "hourly" tick). Needs decay on
 # their own real-time schedule below, so changing HOUR_MS does NOT change how
 # fast the pet gets hungry.
-HOUR_MS = 3600_000  # one "hour" of pet time = one real hour (age/health/death)
+HOUR_MS = 3600_000  # one "hour" of pet time = one real hour (age & health)
+DEATH_MS = 1200_000  # a death roll is made this often (every 20 minutes)
 # How long (real minutes) each need takes to fall from full (100) to empty (0).
 # Real-time and independent of HOUR_MS -> food gets hungry in ~10 min at any
 # speed. Health is NOT in here: it only moves on the hourly tick.
@@ -40,7 +41,7 @@ ACTION_GAIN = {"food": 35.0, "fun": 35.0, "clean": 40.0, "injection": 30.0}
 HEALTH_HURT = 12.0   # health lost per hour per critical stat
 HEALTH_HEAL = 6.0    # health regained per hour when well cared for
 HEALTH_RISK = 20.0   # below this, death is rolled each hour
-DEATH_CHANCE = 0.1   # 1-in-10 per hour when at risk ("let's not be mean")
+DEATH_CHANCE = 0.1   # 1-in-10 each death roll when at risk ("let's not be mean")
 
 SHAPES = ("square", "triangle")
 NAME_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -89,8 +90,8 @@ def _new_pet():
 
 
 class AlertIcon(app.App):
-    """A tiny always-on-top overlay that shows a '!' on the home screen (and
-    over any app) whenever the pet needs attention - like the battery icon."""
+    """A tiny always-on-top overlay that shows a 'mon!' tag on the home screen
+    (and over any app) whenever the pet needs attention - like the battery icon."""
 
     def __init__(self):
         super().__init__()
@@ -100,13 +101,14 @@ class AlertIcon(app.App):
         if not self.show:
             return
         ctx.save()
-        # red disc with a white "!" in the top-right corner
-        ctx.rgb(0.9, 0.15, 0.15).arc(96, -50, 13, 0, 2 * math.pi, False).fill()
+        # small red "mon!" tag in the top-right corner
+        cx, cy = 82, -52
+        ctx.rgb(0.9, 0.15, 0.15).rectangle(cx - 21, cy - 9, 42, 18).fill()
         ctx.rgb(1, 1, 1)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 20
-        ctx.move_to(96, -51).text("!")
+        ctx.font_size = 14
+        ctx.move_to(cx, cy).text("mon!")
         ctx.restore()
 
 
@@ -121,6 +123,7 @@ class EMFMon(app.App):
         self._anim_type = None     # current action animation type, or None
         self._anim_t = 0.0         # ms elapsed in the current animation
         self._hour_acc = 0.0       # ms accumulated toward the next hour tick
+        self._death_acc = 0.0      # ms accumulated toward the next death roll
         self._save_acc = 0.0       # ms accumulated toward the next autosave
         # Always-on-top "!" indicator shown on the home screen (and over any
         # app) whenever the pet needs attention. Started once; persists while
@@ -189,7 +192,13 @@ class EMFMon(app.App):
         while self._hour_acc >= HOUR_MS:
             self._hour_acc -= HOUR_MS
             self._hourly_tick()
-            if not pet["alive"]:
+
+        # Death roll on its own faster cadence (every DEATH_MS = 20 min).
+        self._death_acc += delta
+        while self._death_acc >= DEATH_MS:
+            self._death_acc -= DEATH_MS
+            if pet["health"] < HEALTH_RISK and random.random() < DEATH_CHANCE:
+                self._die()
                 break
 
         self._save_acc += delta
@@ -206,9 +215,6 @@ class EMFMon(app.App):
             pet["health"] = max(0.0, pet["health"] - HEALTH_HURT * criticals)
         elif pet["food"] >= 50 and pet["fun"] >= 50 and pet["clean"] >= 50:
             pet["health"] = min(100.0, pet["health"] + HEALTH_HEAL)
-
-        if pet["health"] < HEALTH_RISK and random.random() < DEATH_CHANCE:
-            self._die()
 
     def _die(self):
         pet = self.pet
