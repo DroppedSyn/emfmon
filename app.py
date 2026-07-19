@@ -592,7 +592,8 @@ class EMFMon(app.App):
 
     def _draw_poops(self, ctx):
         # little brown blobs the pet has left; Clean wipes them away
-        ctx.rgb(0.4, 0.24, 0.08)
+        # (a light, warm brown so it stays visible on the dark screen)
+        ctx.rgb(0.72, 0.48, 0.22)
         for px, py in self.pet.get("poops", []):
             ctx.arc(px, py, 4, 0, 2 * math.pi, False).fill()
 
