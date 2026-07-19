@@ -14,21 +14,31 @@ clean and healthy, or it might not make it.
 | **UP** | Food |
 | **DOWN** | Play |
 | **RIGHT** | Clean |
-| **CONFIRM** | Heal (injection) |
 | **LEFT** | Menu (rename / history / new pet) |
+| **CONFIRM** (C button) | Heal — spends a heal item |
+| **Joystick centre** | Menu |
 | **CANCEL** | Exit |
+
+The joystick's up/down/left/right mirror the corner buttons; its centre press
+opens the menu.
 
 ## Features
 
-- Needs decay in real time (food gets hungry in ~10 min); bars turn **red** below 25%
-- The pet's **face** reacts to its mood — smiles when happy, frowns when a need is
+- Four needs — **Food, Fun, Clean, Health** — with bars that turn **red** below 25%
+- **Real-time decay**: Food gets hungry in ~10 min, Fun ~15, Clean ~20
+- The pet's **face reacts to its mood** — smiles when happy, frowns when a need is
   low, and shows `X_X` when its health is critical
-- A persistent **`!` icon** appears on the home screen (like the battery icon) when
-  the pet needs attention, even when the app is in the background
-- Grows from a tiny dot to full size as it ages
-- Persists to the badge filesystem; keeps a **history** of past pets and how old
-  they got
-- Rename your pet using the badge text entry
+- **Grows** from a tiny dot to full size the more it's looked after
+- Leaves **poop** as it gets dirty; the Clean action wipes it away
+- A **heal inventory** — you gain one heal item every 30 min; spend one with the
+  C button to top up Health
+- A persistent **`mon!` tag** appears on the home screen when the pet needs
+  attention, even while the app is in the background
+- **Persists** across sessions; keeps a **history** of past pets and how old they got
+- **Rename** your pet using the badge text entry
+
+Note: the badge has no real-world clock, so the pet ages and grows over the time
+the badge is switched on and running — not wall-clock time while it's powered off.
 
 ## Licence
 

@@ -54,7 +54,7 @@ NAME_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 # Pet size grows over real running time: a tiny dot at first, full size at GROW_MS.
 PET_MIN_SIZE = 1.5
 PET_MAX_SIZE = 16.0
-GROW_MS = 1800_000  # running-time to grow from a tiny dot to full size (30 min)
+GROW_MS = 10800_000  # on-time to grow from a tiny dot to full size (~3 hours)
 
 # Action feedback animation length (ms).
 ANIM_MS = 800
@@ -97,8 +97,14 @@ def _new_pet():
         "name": _random_name(),
         "shape": random.choice(SHAPES),
         "colour": _random_colour(),
-        "age": 0,          # whole hours survived
-        "grow_ms": 0.0,    # running-time accumulated toward full size (GROW_MS)
+        "age": 0,          # whole hours of on-time survived
+        "grow_ms": 0.0,    # on-time accumulated toward full size (GROW_MS)
+        # Tick accumulators are PERSISTED so age/health/death/heal count on-time
+        # across restarts, the same way grow_ms and the needs already do.
+        "hour_acc": 0.0,   # -> age tick
+        "health_acc": 0.0,  # -> health tick
+        "heal_acc": 0.0,   # -> heal-item gain
+        "death_acc": 0.0,  # -> death roll
         "heals": 0,        # heal items in inventory (gain 1 per HEAL_GAIN_MS)
         "health": 100.0,
         "food": 100.0,
@@ -156,10 +162,8 @@ class EMFMon(app.App):
         self.dialog = None
         self._anim_type = None     # current action animation type, or None
         self._anim_t = 0.0         # ms elapsed in the current animation
-        self._hour_acc = 0.0       # ms accumulated toward the next hour tick
-        self._health_acc = 0.0     # ms accumulated toward the next health tick
-        self._heal_acc = 0.0       # ms accumulated toward the next heal item
-        self._death_acc = 0.0      # ms accumulated toward the next death roll
+        # (the age/health/heal/death accumulators now live in the pet dict so
+        # they persist across restarts - see _new_pet)
         self._save_acc = 0.0       # ms accumulated toward the next autosave
         # Shared always-on-top "mon!" indicator on the home screen (started once
         # for the whole session; see _get_alert_icon).
@@ -234,9 +238,9 @@ class EMFMon(app.App):
         pet["grow_ms"] = min(GROW_MS, pet.get("grow_ms", 0.0) + delta)
 
         # gain one heal item every HEAL_GAIN_MS (up to MAX_HEALS)
-        self._heal_acc += delta
-        while self._heal_acc >= HEAL_GAIN_MS:
-            self._heal_acc -= HEAL_GAIN_MS
+        pet["heal_acc"] = pet.get("heal_acc", 0.0) + delta
+        while pet["heal_acc"] >= HEAL_GAIN_MS:
+            pet["heal_acc"] -= HEAL_GAIN_MS
             pet["heals"] = min(MAX_HEALS, pet.get("heals", 0) + 1)
 
         # drop a poop dot each time Clean has fallen another POOP_STEP
@@ -248,21 +252,21 @@ class EMFMon(app.App):
 
         self._update_notifications()
 
-        self._hour_acc += delta
-        while self._hour_acc >= HOUR_MS:
-            self._hour_acc -= HOUR_MS
+        pet["hour_acc"] = pet.get("hour_acc", 0.0) + delta
+        while pet["hour_acc"] >= HOUR_MS:
+            pet["hour_acc"] -= HOUR_MS
             self._hourly_tick()
 
         # Health tick (every HEALTH_TICK_MS = 30 min): -10% if any need is red.
-        self._health_acc += delta
-        while self._health_acc >= HEALTH_TICK_MS:
-            self._health_acc -= HEALTH_TICK_MS
+        pet["health_acc"] = pet.get("health_acc", 0.0) + delta
+        while pet["health_acc"] >= HEALTH_TICK_MS:
+            pet["health_acc"] -= HEALTH_TICK_MS
             self._health_tick()
 
         # Death roll on its own faster cadence (every DEATH_MS = 20 min).
-        self._death_acc += delta
-        while self._death_acc >= DEATH_MS:
-            self._death_acc -= DEATH_MS
+        pet["death_acc"] = pet.get("death_acc", 0.0) + delta
+        while pet["death_acc"] >= DEATH_MS:
+            pet["death_acc"] -= DEATH_MS
             if pet["health"] < HEALTH_RISK and random.random() < DEATH_CHANCE:
                 self._die()
                 break
@@ -321,10 +325,6 @@ class EMFMon(app.App):
             self.history = self.history[:20]
             self._save_history()
         self.pet = _new_pet()
-        self._hour_acc = 0.0
-        self._health_acc = 0.0
-        self._heal_acc = 0.0
-        self._death_acc = 0.0
         self._anim_type = None
         self.icon.show = False
         self._save_state()
