@@ -54,7 +54,7 @@ NAME_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 # Pet size grows over real running time: a tiny dot at first, full size at GROW_MS.
 PET_MIN_SIZE = 1.5
 PET_MAX_SIZE = 16.0
-GROW_MS = 10800_000  # on-time to grow from a tiny dot to full size (~3 hours)
+GROW_MS = 43200_000  # on-time to grow from a tiny dot to full size (~12 hours)
 
 # Action feedback animation length (ms).
 ANIM_MS = 800
