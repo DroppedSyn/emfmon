@@ -60,6 +60,11 @@ ANIM_MS = 800
 MOVE_CX, MOVE_CY, MOVE_R = 0, -10, 46
 MOVE_SPEED = 0.014  # px per ms of wander speed (lower = slower, gentler)
 
+# Cleanliness "poop" dots: one drops each time Clean falls another POOP_STEP;
+# the Clean action wipes them all away.
+POOP_STEP = 25.0
+MAX_POOPS = 4
+
 try:
     _DIR = __file__.rsplit("/", 1)[0]
 except NameError:
@@ -77,6 +82,13 @@ def _random_colour():
     return [round(0.4 + 0.6 * random.random(), 3) for _ in range(3)]
 
 
+def _random_poop_pos():
+    # a random spot in the pet's central area (clear of the bars/labels)
+    a = random.random() * 2 * math.pi
+    r = random.random() * 50
+    return [round(MOVE_CX + math.cos(a) * r, 1), round(MOVE_CY + math.sin(a) * r, 1)]
+
+
 def _new_pet():
     return {
         "name": _random_name(),
@@ -89,6 +101,8 @@ def _new_pet():
         "food": 100.0,
         "fun": 100.0,
         "clean": 100.0,
+        "poops": [],          # brown dots on screen; Clean wipes them away
+        "clean_mark": 100.0,  # Clean level the poop count is measured down from
         "alive": True,
     }
 
@@ -200,6 +214,13 @@ class EMFMon(app.App):
             self._heal_acc -= HEAL_GAIN_MS
             pet["heals"] = min(MAX_HEALS, pet.get("heals", 0) + 1)
 
+        # drop a poop dot each time Clean has fallen another POOP_STEP
+        poops = pet["poops"]
+        target = int((pet.get("clean_mark", 100.0) - pet["clean"]) / POOP_STEP)
+        target = max(0, min(MAX_POOPS, target))
+        while len(poops) < target:
+            poops.append(_random_poop_pos())
+
         self._update_notifications()
 
         self._hour_acc += delta
@@ -297,6 +318,9 @@ class EMFMon(app.App):
             pet["health"] = min(100.0, pet["health"] + ACTION_GAIN["injection"])
         else:
             pet[action] = min(100.0, pet[action] + ACTION_GAIN[action])
+        if action == "clean":
+            pet["poops"] = []                 # washing wipes the mess away
+            pet["clean_mark"] = pet["clean"]  # re-measure poops from here
         self._anim_type = action  # kick off the feedback animation
         self._anim_t = 0.0
         self._save_state()
@@ -404,6 +428,7 @@ class EMFMon(app.App):
             return
 
         if self.pet["alive"]:
+            self._draw_poops(ctx)
             self._draw_pet(ctx)
             self._draw_action_anim(ctx)
             self._draw_actions(ctx)
@@ -413,6 +438,12 @@ class EMFMon(app.App):
         self._draw_bars(ctx)
         ctx.restore()
         self.draw_overlays(ctx)
+
+    def _draw_poops(self, ctx):
+        # little brown blobs the pet has left; Clean wipes them away
+        ctx.rgb(0.4, 0.24, 0.08)
+        for px, py in self.pet.get("poops", []):
+            ctx.arc(px, py, 4, 0, 2 * math.pi, False).fill()
 
     def _draw_pet(self, ctx):
         r, g, b = self.pet["colour"]
