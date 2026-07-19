@@ -22,6 +22,7 @@ import app
 from app_components import Menu, TextDialog, clear_background
 from app_components.tokens import set_color
 from events.input import BUTTON_TYPES, ButtonDownEvent
+from events.joystick import JOYSTICK_BUTTON_TYPES
 from system.eventbus import eventbus
 from system.notification.events import ShowNotificationEvent
 from system.scheduler import scheduler
@@ -341,14 +342,19 @@ class EMFMon(app.App):
             if BUTTON_TYPES["CONFIRM"] in event.button:
                 self._hatch_new()
             return
-        if BUTTON_TYPES["UP"] in event.button:
+        # Joystick centre press (SELECT) opens the menu - checked before CONFIRM
+        # because JOYFIRE also carries CONFIRM (which the C button uses to heal).
+        if JOYSTICK_BUTTON_TYPES["SELECT"] in event.button:
+            self._open_menu()
+        elif BUTTON_TYPES["UP"] in event.button:
             self._do_action("food")
         elif BUTTON_TYPES["DOWN"] in event.button:
             self._do_action("fun")  # Play - moved to D to clear the OS back button
         elif BUTTON_TYPES["RIGHT"] in event.button:
             self._do_action("clean")
         elif BUTTON_TYPES["CONFIRM"] in event.button:
-            # spend a heal item, but not when already at full health
+            # Heal (the C / CONFIRM button, not the joystick); spend an item,
+            # but not when already at full health
             if self.pet.get("heals", 0) > 0 and self.pet["health"] < 100:
                 self.pet["heals"] -= 1
                 self._do_action("injection")
