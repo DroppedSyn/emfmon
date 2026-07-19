@@ -2,14 +2,16 @@
 
 The pet is a randomly-coloured square or triangle that wanders the screen and
 has four 0-100 stats (higher = better): Health, Food, Fun, Clean. Food/Fun/Clean
-decay over time; when any drops below 10% it turns red and Health suffers on the
-hourly tick, at which point the pet has a small (1/10) chance of dying. Runs in
-the background, persists to a state file, keeps a history of past pets, and pokes
-the main badge screen with a "!" notification when it needs attention.
+decay over real time; a need below 25% turns red and, on the 30-minute health
+tick, drops Health by 10%. Once Health is low the pet has a small chance of
+dying on each 20-minute death roll. The pet grows from a dot to full size, leaves
+"poop" dots as it gets dirty (Clean wipes them), and accrues one heal item every
+30 min. Runs in the background, persists to a state file, keeps a history of past
+pets, and shows a "mon!" tag on the home screen when it needs attention.
 
 Buttons (foreground):
-  UP=Food  LEFT=Play  RIGHT=Clean  CONFIRM=Injection(heal)
-  DOWN=menu (rename / history / new pet)   CANCEL=exit
+  UP=Food  DOWN=Play  RIGHT=Clean  CONFIRM=Heal(spend a heal item)
+  LEFT=menu (rename / history / new pet)   CANCEL=exit
 """
 
 import json
@@ -36,7 +38,7 @@ HEALTH_TICK_MS = 1800_000  # health is adjusted this often (every 30 minutes)
 # speed. Health is NOT in here: it only moves on the hourly tick.
 MINUTES_TO_EMPTY = {"food": 10.0, "fun": 15.0, "clean": 20.0}
 RED_AT = 25.0        # a need below this shows red AND hurts health (25%)
-NOTIFY_AT = 20.0     # send a "!" notification when a need drops below this
+NOTIFY_AT = 30.0     # show the "mon!" alert below this (>= RED_AT, an early warning)
 ACTION_GAIN = {"food": 35.0, "fun": 35.0, "clean": 40.0, "injection": 30.0}
 HEAL_GAIN_MS = 1800_000  # you gain one heal item every 30 minutes (start with 0)
 MAX_HEALS = 9            # cap on stored heal items (keeps the count tidy)
@@ -130,6 +132,19 @@ class AlertIcon(app.App):
         ctx.restore()
 
 
+# One shared AlertIcon overlay for the whole session - starting a fresh one on
+# each relaunch would accumulate orphaned overlays on the home screen.
+_alert_icon = None
+
+
+def _get_alert_icon():
+    global _alert_icon
+    if _alert_icon is None:
+        _alert_icon = AlertIcon()
+        scheduler.start_app(_alert_icon, always_on_top=True)
+    return _alert_icon
+
+
 class EMFMon(app.App):
     def __init__(self):
         super().__init__()
@@ -145,11 +160,10 @@ class EMFMon(app.App):
         self._heal_acc = 0.0       # ms accumulated toward the next heal item
         self._death_acc = 0.0      # ms accumulated toward the next death roll
         self._save_acc = 0.0       # ms accumulated toward the next autosave
-        # Always-on-top "!" indicator shown on the home screen (and over any
-        # app) whenever the pet needs attention. Started once; persists while
-        # EMFMon runs in the background.
-        self.icon = AlertIcon()
-        scheduler.start_app(self.icon, always_on_top=True)
+        # Shared always-on-top "mon!" indicator on the home screen (started once
+        # for the whole session; see _get_alert_icon).
+        self.icon = _get_alert_icon()
+        self.icon.show = False
         # Pet position/velocity for the wandering animation.
         self._x, self._y = MOVE_CX, MOVE_CY
         ang = random.random() * 2 * math.pi
@@ -165,6 +179,16 @@ class EMFMon(app.App):
             # tolerate older/partial files by filling defaults
             base = _new_pet()
             base.update(pet)
+            # guard against a corrupt colour/shape that would crash draw()
+            c = base.get("colour")
+            if not (
+                isinstance(c, list)
+                and len(c) == 3
+                and all(isinstance(v, (int, float)) for v in c)
+            ):
+                base["colour"] = _random_colour()
+            if base.get("shape") not in SHAPES:
+                base["shape"] = random.choice(SHAPES)
             return base
         except Exception:
             return None
@@ -262,6 +286,7 @@ class EMFMon(app.App):
     def _die(self):
         pet = self.pet
         pet["alive"] = False
+        self.icon.show = False  # clear the home-screen alert; the pet is gone
         self.history.insert(
             0,
             {"name": pet["name"], "age": pet["age"], "shape": pet["shape"]},
@@ -281,8 +306,25 @@ class EMFMon(app.App):
         )
 
     def _hatch_new(self):
+        # if we're replacing a still-living pet (Menu -> New pet), log it so it
+        # isn't lost from the history
+        if self.pet.get("alive"):
+            self.history.insert(
+                0,
+                {
+                    "name": self.pet["name"],
+                    "age": self.pet["age"],
+                    "shape": self.pet["shape"],
+                },
+            )
+            self.history = self.history[:20]
+            self._save_history()
         self.pet = _new_pet()
         self._hour_acc = 0.0
+        self._health_acc = 0.0
+        self._heal_acc = 0.0
+        self._death_acc = 0.0
+        self._anim_type = None
         self.icon.show = False
         self._save_state()
 
@@ -306,7 +348,8 @@ class EMFMon(app.App):
         elif BUTTON_TYPES["RIGHT"] in event.button:
             self._do_action("clean")
         elif BUTTON_TYPES["CONFIRM"] in event.button:
-            if self.pet.get("heals", 0) > 0:  # spend a heal item, if any
+            # spend a heal item, but not when already at full health
+            if self.pet.get("heals", 0) > 0 and self.pet["health"] < 100:
                 self.pet["heals"] -= 1
                 self._do_action("injection")
         elif BUTTON_TYPES["LEFT"] in event.button:
@@ -346,7 +389,9 @@ class EMFMon(app.App):
 
     def _show_history_menu(self):
         if self.history:
-            items = [f"{h['name']} - {h['age']}h" for h in self.history]
+            items = [
+                f"{h.get('name', '?')} - {h.get('age', 0)}h" for h in self.history
+            ]
         else:
             items = ["No deaths yet"]
         items.append("Back")
