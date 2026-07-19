@@ -33,7 +33,11 @@ from system.scheduler import scheduler
 # fast the pet gets hungry.
 HOUR_MS = 3600_000  # one "hour" of pet time = one real hour (age only)
 DEATH_MS = 1200_000  # a death roll is made this often (every 20 minutes)
-HEALTH_TICK_MS = 1800_000  # health is adjusted this often (every 30 minutes)
+HEALTH_TICK_MS = 1800_000  # health tick interval at maturity (every 30 minutes)
+# A newborn's health ticks this often instead; the interval eases up to
+# HEALTH_TICK_MS by HEALTH_MATURE_AGE hours. Faster ticks make neglect of a young
+# pet actually show on the health bar (a 30-min tick is invisible in a session).
+HEALTH_TICK_YOUNG_MS = 600_000  # 10 minutes for a newborn
 # How long (real minutes) each need takes to fall from full (100) to empty (0).
 # Real-time and independent of HOUR_MS -> food gets hungry in ~10 min at any
 # speed. Health is NOT in here: it only moves on the hourly tick.
@@ -48,6 +52,11 @@ ACTION_GAIN = {"food": 35.0, "fun": 35.0, "clean": 40.0, "injection": 30.0}
 HEAL_GAIN_MS = 1800_000  # you gain one heal item every 30 minutes (start with 0)
 MAX_HEALS = 9            # cap on stored heal items (keeps the count tidy)
 HEALTH_DROP = 10.0   # health lost each health tick when any need is below RED_AT
+# Younger pets are more fragile: extra health damage that fades to nothing as the
+# pet matures. At age 0 the drop is HEALTH_DROP * (1 + HEALTH_AGE_BONUS); by
+# HEALTH_MATURE_AGE hours it settles to plain HEALTH_DROP (the "as is" baseline).
+HEALTH_AGE_BONUS = 0.6      # up to +60% damage for a newborn
+HEALTH_MATURE_AGE = 12.0    # hours of age at which damage settles to baseline
 HEALTH_HEAL = 6.0    # health regained each health tick when well cared for
 HEALTH_RISK = 20.0   # below this health, death is rolled (every DEATH_MS)
 DEATH_CHANCE = 0.1   # 1-in-10 each death roll when at risk ("let's not be mean")
@@ -343,10 +352,13 @@ class EMFMon(app.App):
             pet["hour_acc"] -= HOUR_MS
             self._hourly_tick()
 
-        # Health tick (every HEALTH_TICK_MS = 30 min): -10% if any need is red.
+        # Health tick: young pets tick faster (down to HEALTH_TICK_YOUNG_MS),
+        # easing to HEALTH_TICK_MS (30 min) by HEALTH_MATURE_AGE hours.
+        maturity = min(1.0, pet["age"] / HEALTH_MATURE_AGE)
+        tick_ms = HEALTH_TICK_YOUNG_MS + (HEALTH_TICK_MS - HEALTH_TICK_YOUNG_MS) * maturity
         pet["health_acc"] = pet.get("health_acc", 0.0) + delta
-        while pet["health_acc"] >= HEALTH_TICK_MS:
-            pet["health_acc"] -= HEALTH_TICK_MS
+        while pet["health_acc"] >= tick_ms:
+            pet["health_acc"] -= tick_ms
             self._health_tick()
 
         # Death roll on its own faster cadence (every DEATH_MS = 20 min).
@@ -370,7 +382,9 @@ class EMFMon(app.App):
         # red (below RED_AT), otherwise slowly recover when well cared for.
         pet = self.pet
         if any(pet[s] < RED_AT for s in ("food", "fun", "clean")):
-            pet["health"] = max(0.0, pet["health"] - HEALTH_DROP)
+            youth = max(0.0, HEALTH_MATURE_AGE - pet["age"]) / HEALTH_MATURE_AGE
+            drop = HEALTH_DROP * (1.0 + HEALTH_AGE_BONUS * youth)
+            pet["health"] = max(0.0, pet["health"] - drop)
         elif pet["food"] >= 50 and pet["fun"] >= 50 and pet["clean"] >= 50:
             pet["health"] = min(100.0, pet["health"] + HEALTH_HEAL)
 
