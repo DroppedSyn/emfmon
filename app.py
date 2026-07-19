@@ -38,6 +38,8 @@ MINUTES_TO_EMPTY = {"food": 10.0, "fun": 15.0, "clean": 20.0}
 RED_AT = 25.0        # a need below this shows red AND hurts health (25%)
 NOTIFY_AT = 20.0     # send a "!" notification when a need drops below this
 ACTION_GAIN = {"food": 35.0, "fun": 35.0, "clean": 40.0, "injection": 30.0}
+HEAL_GAIN_MS = 1800_000  # you gain one heal item every 30 minutes (start with 0)
+MAX_HEALS = 9            # cap on stored heal items (keeps the count tidy)
 HEALTH_DROP = 10.0   # health lost each health tick when any need is below RED_AT
 HEALTH_HEAL = 6.0    # health regained each health tick when well cared for
 HEALTH_RISK = 20.0   # below this health, death is rolled (every DEATH_MS)
@@ -82,6 +84,7 @@ def _new_pet():
         "colour": _random_colour(),
         "age": 0,          # whole hours survived
         "grow_ms": 0.0,    # running-time accumulated toward full size (GROW_MS)
+        "heals": 0,        # heal items in inventory (gain 1 per HEAL_GAIN_MS)
         "health": 100.0,
         "food": 100.0,
         "fun": 100.0,
@@ -125,6 +128,7 @@ class EMFMon(app.App):
         self._anim_t = 0.0         # ms elapsed in the current animation
         self._hour_acc = 0.0       # ms accumulated toward the next hour tick
         self._health_acc = 0.0     # ms accumulated toward the next health tick
+        self._heal_acc = 0.0       # ms accumulated toward the next heal item
         self._death_acc = 0.0      # ms accumulated toward the next death roll
         self._save_acc = 0.0       # ms accumulated toward the next autosave
         # Always-on-top "!" indicator shown on the home screen (and over any
@@ -189,6 +193,12 @@ class EMFMon(app.App):
 
         # grow from a tiny dot to full size over GROW_MS of running time
         pet["grow_ms"] = min(GROW_MS, pet.get("grow_ms", 0.0) + delta)
+
+        # gain one heal item every HEAL_GAIN_MS (up to MAX_HEALS)
+        self._heal_acc += delta
+        while self._heal_acc >= HEAL_GAIN_MS:
+            self._heal_acc -= HEAL_GAIN_MS
+            pet["heals"] = min(MAX_HEALS, pet.get("heals", 0) + 1)
 
         self._update_notifications()
 
@@ -275,7 +285,9 @@ class EMFMon(app.App):
         elif BUTTON_TYPES["RIGHT"] in event.button:
             self._do_action("clean")
         elif BUTTON_TYPES["CONFIRM"] in event.button:
-            self._do_action("injection")
+            if self.pet.get("heals", 0) > 0:  # spend a heal item, if any
+                self.pet["heals"] -= 1
+                self._do_action("injection")
         elif BUTTON_TYPES["LEFT"] in event.button:
             self._open_menu()
 
@@ -517,8 +529,14 @@ class EMFMon(app.App):
         ctx.move_to(0, -104).text("Food")        # UP     (top)
         ctx.move_to(-94, 30).text("Menu")        # LEFT   (lower-left)
         ctx.move_to(94, -24).text("Clean")       # RIGHT  (upper-right)
-        ctx.move_to(94, 30).text("Heal")         # CONFIRM(lower-right)
         ctx.move_to(0, 108).text("Play")         # DOWN   (bottom, under bars)
+        # Heal shows how many heal items you have; dimmed when you have none
+        heals = self.pet.get("heals", 0)
+        if heals > 0:
+            set_color(ctx, "label")
+        else:
+            ctx.rgb(0.4, 0.4, 0.4)
+        ctx.move_to(86, 30).text("Heal x%d" % heals)  # CONFIRM (lower-right)
 
     def _draw_dead(self, ctx):
         ctx.text_align = ctx.CENTER
