@@ -27,6 +27,34 @@ from system.eventbus import eventbus
 from system.notification.events import ShowNotificationEvent
 from system.scheduler import scheduler
 
+
+def _seed_rng():
+    # Seed the RNG from hardware entropy so every badge doesn't hatch the SAME
+    # pet. `random` is seeded once at boot from esp_random(), but that early in
+    # boot (before RF is up) freshly-flashed badges can get near-identical seeds
+    # -> the same sequence -> everyone gets the first shape in SHAPES (square).
+    # os.urandom is the ESP32 hardware RNG and, by the time the app launches
+    # (WiFi has been up to download it), has full entropy. Mix in ticks too.
+    seed = 0
+    try:
+        import time
+        seed ^= time.ticks_us() & 0xFFFFFFFF
+    except Exception:
+        pass
+    try:
+        import os
+        b = os.urandom(4)
+        seed ^= b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
+    except Exception:
+        pass
+    try:
+        random.seed(seed & 0xFFFFFFFF)
+    except Exception:
+        pass
+
+
+_seed_rng()
+
 # --- Tunables --------------------------------------------------------------
 # HOUR_MS governs age/health/death only (the "hourly" tick). Needs decay on
 # their own real-time schedule below, so changing HOUR_MS does NOT change how
@@ -72,6 +100,38 @@ SHAPES = (
     "star",
 )
 NAME_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# Personality traits: each pet is born with one, tweaking how fast some needs
+# decay (a multiplier on that stat's decay). Adds flavour + replayability.
+TRAITS = ("greedy", "playful", "messy", "tidy", "hardy")
+TRAIT_DECAY = {
+    "greedy": {"food": 1.6},           # always hungry
+    "playful": {"fun": 1.6},           # bores easily
+    "messy": {"clean": 1.6},           # gets grubby fast
+    "tidy": {"clean": 0.5},            # stays clean
+    "hardy": {"food": 0.7, "fun": 0.7, "clean": 0.7},  # low-maintenance
+}
+TRAIT_LABEL = {
+    "greedy": "Greedy", "playful": "Playful", "messy": "Messy",
+    "tidy": "Tidy", "hardy": "Hardy",
+}
+
+# Life stages by age (hours of on-time) - cosmetic: babies have no mouth and
+# bigger eyes, children keep the bigger eyes, elders (24h+) earn a gold crown.
+STAGE_CHILD_AGE = 2   # baby:  0-2 h
+STAGE_ADULT_AGE = 6   # child: 2-6 h
+STAGE_ELDER_AGE = 48  # adult: 6-48 h, elder: 48 h+
+STAGE_LABEL = {"baby": "Baby", "child": "Child", "adult": "Adult", "elder": "Elder"}
+
+
+def _life_stage(age):
+    if age < STAGE_CHILD_AGE:
+        return "baby"
+    if age < STAGE_ADULT_AGE:
+        return "child"
+    if age < STAGE_ELDER_AGE:
+        return "adult"
+    return "elder"
 
 # Pet size grows over real running time: a tiny dot at first, full size at GROW_MS.
 PET_MIN_SIZE = 1.5
@@ -148,6 +208,7 @@ def _new_pet():
     return {
         "name": _random_name(),
         "shape": random.choice(SHAPES),
+        "trait": random.choice(TRAITS),  # personality, tweaks decay (TRAIT_DECAY)
         "colour": _random_colour(),
         "age": 0,          # whole hours of on-time survived
         "grow_ms": 0.0,    # on-time accumulated toward full size (GROW_MS)
@@ -204,9 +265,23 @@ def _get_alert_icon():
     return _alert_icon
 
 
+# Only the most recently launched EMFMon simulates and saves. minimise() (the
+# CANCEL exit) pops the foreground but does NOT stop the app's background task,
+# and the launcher builds a fresh instance on every launch - so old instances
+# keep running their background_update loop and would race on state.json,
+# reverting your actions ~15s later. The newest instance claims _active_mon in
+# __init__; stale instances no-op. (Same relaunch-accumulation issue that the
+# AlertIcon singleton above already guards against.)
+_active_mon = None
+
+
 class EMFMon(app.App):
     def __init__(self):
         super().__init__()
+        # Claim the active slot so any older instance left running in the
+        # background (see _active_mon) stops simulating and saving.
+        global _active_mon
+        _active_mon = self
         self.pet = self._load_state() or _new_pet()
         self.history = self._load_history()
         self.view = "pet"          # "pet" | "menu"
@@ -246,14 +321,19 @@ class EMFMon(app.App):
                 base["colour"] = _random_colour()
             if base.get("shape") not in SHAPES:
                 base["shape"] = random.choice(SHAPES)
+            if base.get("trait") not in TRAITS:
+                base["trait"] = random.choice(TRAITS)
             # coerce numeric fields - a wrong-typed value from a corrupt or
             # hand-edited save would otherwise crash the background simulation
             d = _new_pet()  # pristine defaults (its numeric fields are fixed)
             for k in ("age", "heals"):
                 try:
-                    base[k] = int(base[k])
+                    base[k] = max(0, int(base[k]))  # never negative
                 except (TypeError, ValueError):
                     base[k] = d[k]
+            # a negative age would make the health-tick interval <= 0 and hang
+            # the badge in an infinite while-loop; max(0, ...) above prevents it.
+            base["heals"] = min(MAX_HEALS, base["heals"])
             for k in (
                 "grow_ms", "hour_acc", "health_acc", "heal_acc", "death_acc",
                 "health", "food", "fun", "clean", "clean_mark",
@@ -262,6 +342,12 @@ class EMFMon(app.App):
                     base[k] = float(base[k])
                 except (TypeError, ValueError):
                     base[k] = d[k]
+            # clamp to sane ranges so a corrupt/hand-edited save can't misbehave
+            for k in ("health", "food", "fun", "clean", "clean_mark"):
+                base[k] = min(100.0, max(0.0, base[k]))
+            for k in ("grow_ms", "hour_acc", "health_acc", "heal_acc", "death_acc"):
+                base[k] = max(0.0, base[k])
+            base["grow_ms"] = min(GROW_MS, base["grow_ms"])
             # poops must be a list of [x, y] number pairs
             poops = base.get("poops")
             if isinstance(poops, list):
@@ -281,6 +367,8 @@ class EMFMon(app.App):
             return None
 
     def _save_state(self):
+        if self is not _active_mon:
+            return  # never let a stale instance overwrite the live save
         try:
             with open(STATE_PATH, "w") as f:
                 f.write(json.dumps(self.pet))
@@ -303,6 +391,8 @@ class EMFMon(app.App):
 
     # --- simulation (runs in background AND foreground) --------------------
     def background_update(self, delta):
+        if self is not _active_mon:
+            return  # a stale instance from an earlier launch - stay quiet
         # The framework does NOT catch exceptions raised here (background_task
         # has no try/except and the scheduler's background error monitor is
         # disabled), so an unhandled error would SILENTLY freeze the pet for the
@@ -324,9 +414,11 @@ class EMFMon(app.App):
         # Older pets decay more slowly (see DECAY_AGE_REDUCTION). Health is not
         # touched here - it changes on the health tick below.
         decay_mult = max(DECAY_MIN_MULT, 1.0 - DECAY_AGE_REDUCTION * pet["age"])
+        trait_decay = TRAIT_DECAY.get(pet.get("trait"), {})
         for stat, mins in MINUTES_TO_EMPTY.items():
+            m = decay_mult * trait_decay.get(stat, 1.0)  # personality tweak
             pet[stat] = max(
-                0.0, pet[stat] - delta * 100.0 / (mins * 60_000.0) * decay_mult
+                0.0, pet[stat] - delta * 100.0 / (mins * 60_000.0) * m
             )
 
         # grow from a tiny dot to full size over GROW_MS of running time
@@ -354,7 +446,7 @@ class EMFMon(app.App):
 
         # Health tick: young pets tick faster (down to HEALTH_TICK_YOUNG_MS),
         # easing to HEALTH_TICK_MS (30 min) by HEALTH_MATURE_AGE hours.
-        maturity = min(1.0, pet["age"] / HEALTH_MATURE_AGE)
+        maturity = min(1.0, max(0.0, pet["age"] / HEALTH_MATURE_AGE))
         tick_ms = HEALTH_TICK_YOUNG_MS + (HEALTH_TICK_MS - HEALTH_TICK_YOUNG_MS) * maturity
         pet["health_acc"] = pet.get("health_acc", 0.0) + delta
         while pet["health_acc"] >= tick_ms:
@@ -633,6 +725,7 @@ class EMFMon(app.App):
             ctx.arc(x, y, s, 0, 2 * math.pi, False).fill()  # unknown -> circle
 
         # A face, once the pet is big enough for it to actually render.
+        stage = _life_stage(self.pet["age"])
         if s >= 5:
             pet = self.pet
             if pet["health"] < RED_AT:
@@ -641,16 +734,21 @@ class EMFMon(app.App):
                 mood = "unhappy"  # a need is low - frown
             else:
                 mood = "happy"
-            self._draw_face(ctx, x, face_cy, s, mood)
+            self._draw_face(ctx, x, face_cy, s, mood, stage)
+        # elders wear a little gold crown, sitting on top of the body
+        if stage == "elder" and s >= 4:
+            self._draw_crown(ctx, x, y - s, s)
 
-    def _draw_face(self, ctx, x, cy, s, mood):
+    def _draw_face(self, ctx, x, cy, s, mood, stage="adult"):
+        # young pets get bigger, cuter eyes
+        eye_scale = 1.3 if stage in ("baby", "child") else 1.0
         eye_dx = s * 0.34
         eye_y = cy - s * 0.15
         ctx.line_width = max(1.0, s * 0.09)
         if mood == "dying":
             # X_X eyes (two crossed strokes each)
             ctx.rgb(0, 0, 0)
-            er = s * 0.16
+            er = s * 0.16 * eye_scale
             for sx in (-eye_dx, eye_dx):
                 ex = x + sx
                 ctx.begin_path()
@@ -662,8 +760,10 @@ class EMFMon(app.App):
         else:
             # round eyes with a black pupil (readable on any body colour)
             for sx in (-eye_dx, eye_dx):
-                ctx.rgb(1, 1, 1).arc(x + sx, eye_y, s * 0.2, 0, 2 * math.pi, False).fill()
-                ctx.rgb(0, 0, 0).arc(x + sx, eye_y, s * 0.09, 0, 2 * math.pi, False).fill()
+                ctx.rgb(1, 1, 1).arc(x + sx, eye_y, s * 0.2 * eye_scale, 0, 2 * math.pi, False).fill()
+                ctx.rgb(0, 0, 0).arc(x + sx, eye_y, s * 0.09 * eye_scale, 0, 2 * math.pi, False).fill()
+        if stage == "baby":
+            return  # babies have no mouth yet
         # mouth: smile when happy, frown otherwise
         ctx.rgb(0, 0, 0)
         ctx.begin_path()
@@ -672,6 +772,22 @@ class EMFMon(app.App):
         else:
             ctx.arc(x, cy + s * 0.55, s * 0.32, 1.18 * math.pi, 1.82 * math.pi, False)
         ctx.stroke()
+
+    def _draw_crown(self, ctx, x, yb, s):
+        # a little three-point gold crown perched on an elder's head (base at yb)
+        w = s * 0.8
+        h = s * 0.55
+        ctx.rgb(1.0, 0.84, 0.0)
+        ctx.begin_path()
+        ctx.move_to(x - w, yb)
+        ctx.line_to(x - w, yb - h * 0.55)
+        ctx.line_to(x - w * 0.45, yb - h * 0.2)
+        ctx.line_to(x, yb - h)
+        ctx.line_to(x + w * 0.45, yb - h * 0.2)
+        ctx.line_to(x + w, yb - h * 0.55)
+        ctx.line_to(x + w, yb)
+        ctx.close_path()
+        ctx.fill()
 
     def _draw_action_anim(self, ctx):
         if self._anim_type is None:
@@ -778,6 +894,13 @@ class EMFMon(app.App):
         ctx.text_align = ctx.CENTER
         ctx.font_size = 12
         ctx.move_to(0, -88).text(f"{self.pet['name']}   {self.pet['age']}h")
+        # personality + life stage, a small subtitle under the name
+        stage = _life_stage(self.pet["age"])
+        sub = (TRAIT_LABEL.get(self.pet.get("trait"), "") + "  " + STAGE_LABEL.get(stage, "")).strip()
+        if sub:
+            ctx.font_size = 9
+            ctx.rgb(0.55, 0.55, 0.6)
+            ctx.move_to(0, -76).text(sub)
 
 
 __app_export__ = EMFMon
