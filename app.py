@@ -38,6 +38,10 @@ HEALTH_TICK_MS = 1800_000  # health is adjusted this often (every 30 minutes)
 # Real-time and independent of HOUR_MS -> food gets hungry in ~10 min at any
 # speed. Health is NOT in here: it only moves on the hourly tick.
 MINUTES_TO_EMPTY = {"food": 10.0, "fun": 15.0, "clean": 20.0}
+# Older pets are hardier: each hour of age reduces need-decay by this fraction,
+# down to DECAY_MIN_MULT (decay slows but never stops or reverses).
+DECAY_AGE_REDUCTION = 0.05
+DECAY_MIN_MULT = 0.1
 RED_AT = 25.0        # a need below this shows red AND hurts health (25%)
 NOTIFY_AT = 30.0     # show the "mon!" alert below this (>= RED_AT, an early warning)
 ACTION_GAIN = {"food": 35.0, "fun": 35.0, "clean": 40.0, "injection": 30.0}
@@ -48,7 +52,16 @@ HEALTH_HEAL = 6.0    # health regained each health tick when well cared for
 HEALTH_RISK = 20.0   # below this health, death is rolled (every DEATH_MS)
 DEATH_CHANCE = 0.1   # 1-in-10 each death roll when at risk ("let's not be mean")
 
-SHAPES = ("square", "triangle")
+SHAPES = (
+    "square",
+    "triangle",
+    "circle",
+    "diamond",
+    "pentagon",
+    "hexagon",
+    "octagon",
+    "star",
+)
 NAME_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # Pet size grows over real running time: a tiny dot at first, full size at GROW_MS.
@@ -90,6 +103,36 @@ def _random_poop_pos():
     a = random.random() * 2 * math.pi
     r = random.random() * 50
     return [round(MOVE_CX + math.cos(a) * r, 1), round(MOVE_CY + math.sin(a) * r, 1)]
+
+
+def _fill_polygon(ctx, x, y, s, n, rot):
+    # a regular n-sided polygon of radius s, first vertex at angle `rot`
+    ctx.begin_path()
+    step = 2 * math.pi / n
+    for i in range(n):
+        a = rot + i * step
+        px, py = x + math.cos(a) * s, y + math.sin(a) * s
+        if i == 0:
+            ctx.move_to(px, py)
+        else:
+            ctx.line_to(px, py)
+    ctx.close_path()
+    ctx.fill()
+
+
+def _fill_star(ctx, x, y, s):
+    # a 5-point star (alternating outer/inner radius)
+    ctx.begin_path()
+    for i in range(10):
+        a = -math.pi / 2 + i * (math.pi / 5)
+        r = s if i % 2 == 0 else s * 0.42
+        px, py = x + math.cos(a) * r, y + math.sin(a) * r
+        if i == 0:
+            ctx.move_to(px, py)
+        else:
+            ctx.line_to(px, py)
+    ctx.close_path()
+    ctx.fill()
 
 
 def _new_pet():
@@ -194,6 +237,36 @@ class EMFMon(app.App):
                 base["colour"] = _random_colour()
             if base.get("shape") not in SHAPES:
                 base["shape"] = random.choice(SHAPES)
+            # coerce numeric fields - a wrong-typed value from a corrupt or
+            # hand-edited save would otherwise crash the background simulation
+            d = _new_pet()  # pristine defaults (its numeric fields are fixed)
+            for k in ("age", "heals"):
+                try:
+                    base[k] = int(base[k])
+                except (TypeError, ValueError):
+                    base[k] = d[k]
+            for k in (
+                "grow_ms", "hour_acc", "health_acc", "heal_acc", "death_acc",
+                "health", "food", "fun", "clean", "clean_mark",
+            ):
+                try:
+                    base[k] = float(base[k])
+                except (TypeError, ValueError):
+                    base[k] = d[k]
+            # poops must be a list of [x, y] number pairs
+            poops = base.get("poops")
+            if isinstance(poops, list):
+                base["poops"] = [
+                    p
+                    for p in poops
+                    if isinstance(p, (list, tuple))
+                    and len(p) == 2
+                    and all(isinstance(v, (int, float)) for v in p)
+                ]
+            else:
+                base["poops"] = []
+            if not isinstance(base.get("alive"), bool):
+                base["alive"] = True
             return base
         except Exception:
             return None
@@ -221,18 +294,31 @@ class EMFMon(app.App):
 
     # --- simulation (runs in background AND foreground) --------------------
     def background_update(self, delta):
-        # background_update is called for every app whether focused or not, so
-        # ALL time-based simulation lives here (update() only does foreground
-        # visuals) to avoid double-counting when the app is in the foreground.
+        # The framework does NOT catch exceptions raised here (background_task
+        # has no try/except and the scheduler's background error monitor is
+        # disabled), so an unhandled error would SILENTLY freeze the pet for the
+        # whole session. Guard it: log and let the next tick continue.
+        try:
+            self._simulate(delta)
+        except Exception as e:
+            print("EMFMon bg error:", e)
+
+    def _simulate(self, delta):
+        # Runs every tick whether foreground or not (update() only does the
+        # foreground visuals); all time-based simulation lives here.
         pet = self.pet
         if not pet["alive"]:
             return
 
         # Needs decay on a real-time schedule (MINUTES_TO_EMPTY), independent of
         # the HOUR_MS tick, so food empties in ~10 real minutes at any speed.
-        # Health is not touched here - it changes on the health tick below.
+        # Older pets decay more slowly (see DECAY_AGE_REDUCTION). Health is not
+        # touched here - it changes on the health tick below.
+        decay_mult = max(DECAY_MIN_MULT, 1.0 - DECAY_AGE_REDUCTION * pet["age"])
         for stat, mins in MINUTES_TO_EMPTY.items():
-            pet[stat] = max(0.0, pet[stat] - delta * 100.0 / (mins * 60_000.0))
+            pet[stat] = max(
+                0.0, pet[stat] - delta * 100.0 / (mins * 60_000.0) * decay_mult
+            )
 
         # grow from a tiny dot to full size over GROW_MS of running time
         pet["grow_ms"] = min(GROW_MS, pet.get("grow_ms", 0.0) + delta)
@@ -335,6 +421,11 @@ class EMFMon(app.App):
             return  # the text dialog owns the buttons while open
         if self.view == "menu":
             return  # the Menu widget handles its own buttons
+        # Ignore the joystick centre press entirely - it's flaky (opens the menu
+        # then instantly selects Rename). LEFT=Menu and C=Heal cover everything.
+        # Checked before CONFIRM because JOYFIRE also carries CONFIRM.
+        if JOYSTICK_BUTTON_TYPES["SELECT"] in event.button:
+            return
         if BUTTON_TYPES["CANCEL"] in event.button:
             self.minimise()
             return
@@ -342,19 +433,14 @@ class EMFMon(app.App):
             if BUTTON_TYPES["CONFIRM"] in event.button:
                 self._hatch_new()
             return
-        # Joystick centre press (SELECT) opens the menu - checked before CONFIRM
-        # because JOYFIRE also carries CONFIRM (which the C button uses to heal).
-        if JOYSTICK_BUTTON_TYPES["SELECT"] in event.button:
-            self._open_menu()
-        elif BUTTON_TYPES["UP"] in event.button:
+        if BUTTON_TYPES["UP"] in event.button:
             self._do_action("food")
         elif BUTTON_TYPES["DOWN"] in event.button:
             self._do_action("fun")  # Play - moved to D to clear the OS back button
         elif BUTTON_TYPES["RIGHT"] in event.button:
             self._do_action("clean")
         elif BUTTON_TYPES["CONFIRM"] in event.button:
-            # Heal (the C / CONFIRM button, not the joystick); spend an item,
-            # but not when already at full health
+            # Heal (the C / CONFIRM button); spend an item, but not at full HP
             if self.pet.get("heals", 0) > 0 and self.pet["health"] < 100:
                 self.pet["heals"] -= 1
                 self._do_action("injection")
@@ -503,19 +589,33 @@ class EMFMon(app.App):
         s = PET_MIN_SIZE + (PET_MAX_SIZE - PET_MIN_SIZE) * grow
         x, y = self._x, self._y
         ctx.rgb(r, g, b)
-        if self.pet["shape"] == "square":
+        shape = self.pet["shape"]
+        face_cy = y  # face centred by default
+        if shape == "square":
             ctx.rectangle(x - s, y - s, 2 * s, 2 * s).fill()
-            face_cy = y
-        else:
-            # separate path calls (line_to does not chain) - matches the
-            # proven pattern in lib/simple_tildagon.py
+        elif shape == "circle":
+            ctx.arc(x, y, s, 0, 2 * math.pi, False).fill()
+        elif shape == "triangle":
+            # drawn apex-up (not a centred regular tri), so drop the face lower
             ctx.begin_path()
             ctx.move_to(x, y - s)
             ctx.line_to(x + s, y + s)
             ctx.line_to(x - s, y + s)
             ctx.close_path()
             ctx.fill()
-            face_cy = y + s * 0.35  # sits lower, over the triangle's body
+            face_cy = y + s * 0.35
+        elif shape == "diamond":
+            _fill_polygon(ctx, x, y, s, 4, -math.pi / 2)
+        elif shape == "pentagon":
+            _fill_polygon(ctx, x, y, s, 5, -math.pi / 2)
+        elif shape == "hexagon":
+            _fill_polygon(ctx, x, y, s, 6, 0.0)
+        elif shape == "octagon":
+            _fill_polygon(ctx, x, y, s, 8, math.pi / 8)
+        elif shape == "star":
+            _fill_star(ctx, x, y, s)
+        else:
+            ctx.arc(x, y, s, 0, 2 * math.pi, False).fill()  # unknown -> circle
 
         # A face, once the pet is big enough for it to actually render.
         if s >= 5:

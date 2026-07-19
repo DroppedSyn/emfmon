@@ -2,7 +2,8 @@
 
 A Tamagotchi-style virtual pet for the [EMF Tildagon badge](https://tildagon.badge.emfcamp.org/).
 
-Your pet is a randomly-coloured square or triangle with a little face. It hatches
+Your pet is a randomly-coloured shape — one of eight (square, triangle, circle,
+diamond, pentagon, hexagon, octagon or star) — with a little face. It hatches
 as a tiny dot and **grows with your badge over time**, wandering the screen while
 four needs — **Health, Food, Fun, Clean** — slowly drain. Keep it fed, entertained,
 clean and healthy, or it might not make it.
@@ -16,11 +17,9 @@ clean and healthy, or it might not make it.
 | **RIGHT** | Clean |
 | **LEFT** | Menu (rename / history / new pet) |
 | **CONFIRM** (C button) | Heal — spends a heal item |
-| **Joystick centre** | Menu |
 | **CANCEL** | Exit |
 
-The joystick's up/down/left/right mirror the corner buttons; its centre press
-opens the menu.
+The joystick's up/down/left/right mirror the corner buttons.
 
 ## Features
 
