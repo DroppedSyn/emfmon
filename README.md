@@ -93,6 +93,27 @@ Note: the badge has no real-world clock, so the pet ages, grows and decays over 
 time the badge is **switched on and running** — not wall-clock time while it's powered
 off.
 
+## Battles (Menu → Battle)
+
+Your pet can **fight other badges** over the badge's ESP-NOW radio — no WiFi network
+needed, just two badges near each other.
+
+- **Find opponent** — your badge lists nearby EMFMon players; pick one and send an
+  invite, and they get to **accept or decline**. Once both agree, the mons trade shots
+  and the winner is decided by a small **strength** edge on a forgiving coin-flip (even
+  a weak pet wins about a quarter of the time). The **loser drops to 25% health** and
+  the **winner to 75%**, so battling burns through your heal items.
+- **Practice** — a free solo spar against a random opponent: it plays out fully but
+  **costs no health and doesn't count** toward your ranked record.
+- **Records** — a **Ranked** tally (with a scrolling list of who you beat/lost to) and a
+  separate **Practice** win/loss counter.
+- **Strength** is a mostly-hidden stat: pets are born middling and it **creeps up the
+  longer you keep them healthy**, so a well-cared-for pet fights a little better.
+
+To battle, your pet must be an **adult (6h+)** and at **full health**. Both badges need
+to be on the **same WiFi (or both with WiFi off)** so their radios share a channel — if
+they can't find each other the screen will tell you what to check.
+
 ## Licence
 
 MIT

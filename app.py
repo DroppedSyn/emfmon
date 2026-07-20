@@ -150,6 +150,16 @@ MOVE_SPEED = 0.014  # px per ms of wander speed (lower = slower, gentler)
 POOP_STEP = 25.0
 MAX_POOPS = 4
 
+# Strength: a mostly-hidden stat used only by the optional battle addon
+# (battle.py). Born middle-ish so there are no god-tier newborns, and it creeps
+# up slowly while the pet is kept healthy (fitness). Battle influence is small
+# and clamped, so it never makes a pet unbeatable.
+STRENGTH_MIN = 1
+STRENGTH_MAX = 10
+STRENGTH_BIRTH = (4, 5, 5, 6, 6, 7)  # middle-biased birth roll
+FIT_HEALTH_MIN = 90.0    # health must be at least this to build fitness
+FIT_GAIN_MS = 7200_000   # +1 strength per this much on-time kept healthy (~2h)
+
 try:
     _DIR = __file__.rsplit("/", 1)[0]
 except NameError:
@@ -210,6 +220,8 @@ def _new_pet():
         "shape": random.choice(SHAPES),
         "trait": random.choice(TRAITS),  # personality, tweaks decay (TRAIT_DECAY)
         "colour": _random_colour(),
+        "strength": random.choice(STRENGTH_BIRTH),  # battle stat (battle.py)
+        "fit_acc": 0.0,    # on-time-kept-healthy accumulated toward +1 strength
         "age": 0,          # whole hours of on-time survived
         "grow_ms": 0.0,    # on-time accumulated toward full size (GROW_MS)
         # Tick accumulators are PERSISTED so age/health/death/heal count on-time
@@ -284,9 +296,10 @@ class EMFMon(app.App):
         _active_mon = self
         self.pet = self._load_state() or _new_pet()
         self.history = self._load_history()
-        self.view = "pet"          # "pet" | "menu"
+        self.view = "pet"          # "pet" | "menu" | "battle"
         self.menu = None
         self.dialog = None
+        self.battle = None         # optional battle addon controller (battle.py)
         self._anim_type = None     # current action animation type, or None
         self._anim_t = 0.0         # ms elapsed in the current animation
         # (the age/health/heal/death accumulators now live in the pet dict so
@@ -326,7 +339,7 @@ class EMFMon(app.App):
             # coerce numeric fields - a wrong-typed value from a corrupt or
             # hand-edited save would otherwise crash the background simulation
             d = _new_pet()  # pristine defaults (its numeric fields are fixed)
-            for k in ("age", "heals"):
+            for k in ("age", "heals", "strength"):
                 try:
                     base[k] = max(0, int(base[k]))  # never negative
                 except (TypeError, ValueError):
@@ -334,9 +347,10 @@ class EMFMon(app.App):
             # a negative age would make the health-tick interval <= 0 and hang
             # the badge in an infinite while-loop; max(0, ...) above prevents it.
             base["heals"] = min(MAX_HEALS, base["heals"])
+            base["strength"] = min(STRENGTH_MAX, max(STRENGTH_MIN, base["strength"]))
             for k in (
                 "grow_ms", "hour_acc", "health_acc", "heal_acc", "death_acc",
-                "health", "food", "fun", "clean", "clean_mark",
+                "fit_acc", "health", "food", "fun", "clean", "clean_mark",
             ):
                 try:
                     base[k] = float(base[k])
@@ -345,7 +359,8 @@ class EMFMon(app.App):
             # clamp to sane ranges so a corrupt/hand-edited save can't misbehave
             for k in ("health", "food", "fun", "clean", "clean_mark"):
                 base[k] = min(100.0, max(0.0, base[k]))
-            for k in ("grow_ms", "hour_acc", "health_acc", "heal_acc", "death_acc"):
+            for k in ("grow_ms", "hour_acc", "health_acc", "heal_acc",
+                      "death_acc", "fit_acc"):
                 base[k] = max(0.0, base[k])
             base["grow_ms"] = min(GROW_MS, base["grow_ms"])
             # poops must be a list of [x, y] number pairs
@@ -429,6 +444,14 @@ class EMFMon(app.App):
         while pet["heal_acc"] >= HEAL_GAIN_MS:
             pet["heal_acc"] -= HEAL_GAIN_MS
             pet["heals"] = min(MAX_HEALS, pet.get("heals", 0) + 1)
+
+        # fitness: strength creeps up slowly while the pet is kept healthy
+        # (only counts on-time spent at high health; never decreases)
+        if pet.get("health", 0.0) >= FIT_HEALTH_MIN and pet.get("strength", 0) < STRENGTH_MAX:
+            pet["fit_acc"] = pet.get("fit_acc", 0.0) + delta
+            while pet["fit_acc"] >= FIT_GAIN_MS and pet["strength"] < STRENGTH_MAX:
+                pet["fit_acc"] -= FIT_GAIN_MS
+                pet["strength"] += 1
 
         # drop a poop dot each time Clean has fallen another POOP_STEP
         poops = pet["poops"]
@@ -525,6 +548,8 @@ class EMFMon(app.App):
     def _on_button(self, event: ButtonDownEvent):
         if self.dialog is not None:
             return  # the text dialog owns the buttons while open
+        if self.view == "battle":
+            return  # Battle registers its own ButtonDownEvent handler (battle.py)
         if self.view == "menu":
             return  # the Menu widget handles its own buttons
         # Ignore the joystick centre press entirely - it's flaky (opens the menu
@@ -574,16 +599,40 @@ class EMFMon(app.App):
             elif value == "History":
                 self.view = "menu"
                 self._show_history_menu()
+            elif value == "Battle":
+                self._open_battle()
             elif value == "New pet":
                 self._hatch_new()
 
         self.menu = Menu(
             self,
-            menu_items=["Rename", "History", "New pet", "Back"],
+            menu_items=["Rename", "History", "Battle", "New pet", "Back"],
             select_handler=on_select,
             back_handler=self._close_menu,
         )
         self.view = "menu"
+
+    def _open_battle(self):
+        # Battle is an OPTIONAL addon - if it fails to import or construct, the
+        # pet must carry on unaffected, so swallow everything and stay on the pet.
+        try:
+            from .battle import Battle
+            self.battle = Battle(self)
+            self._battle_draw_errs = 0
+            self.view = "battle"
+        except Exception as e:
+            print("EMFMon: battle unavailable:", e)
+            self.battle = None
+            self.view = "pet"
+
+    def _close_battle(self):
+        if self.battle is not None:
+            try:
+                self.battle.close()
+            except Exception as e:
+                print("EMFMon: battle close error:", e)
+            self.battle = None
+        self.view = "pet"
 
     def _show_history_menu(self):
         if self.history:
@@ -617,6 +666,16 @@ class EMFMon(app.App):
 
     # --- foreground update (movement + overlays) ---------------------------
     def update(self, delta):
+        if self.view == "battle" and self.battle is not None:
+            try:
+                self.battle.update(delta)
+            except Exception as e:
+                print("EMFMon: battle update error:", e)
+                self._close_battle()
+                return True
+            if self.battle.done:
+                self._close_battle()
+            return True
         if self.dialog is not None:
             # drive the text dialog to completion, then apply the new name
             if self.dialog._result is not None:
@@ -663,6 +722,21 @@ class EMFMon(app.App):
     # --- drawing -----------------------------------------------------------
     def draw(self, ctx):
         ctx.save()
+
+        if self.view == "battle" and self.battle is not None:
+            try:
+                self.battle.draw(ctx)
+                self._battle_draw_errs = 0
+            except Exception as e:
+                print("EMFMon: battle draw error:", e)
+                # bail out of the battle view if drawing keeps failing, so a
+                # persistent error can't strand the user on a broken screen
+                self._battle_draw_errs = getattr(self, "_battle_draw_errs", 0) + 1
+                if self._battle_draw_errs >= 5:
+                    self._close_battle()
+            ctx.restore()
+            return
+
         clear_background(ctx)
 
         if self.view == "menu" and self.menu is not None:
