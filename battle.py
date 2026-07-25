@@ -25,6 +25,7 @@ handshake is the next stage - challenging a peer currently shows a note.
 import gc
 import json
 import math
+import struct
 
 from app_components import clear_background
 from app_components.tokens import set_color
@@ -203,7 +204,7 @@ class Battle:
     """Owns the battle view: menu, records, BLE discovery, and animation.
 
     States: menu | info | records | rec_ranked | rec_practice | searching |
-            anim | result   (the GATT handshake will add its own).
+            invited | handshaking | anim | result.
     """
 
     def __init__(self, app):
@@ -238,6 +239,12 @@ class Battle:
         self.peer_idx = 0
         self._search_t = 0.0
         self._peer_refresh = 0.0   # throttle peer_list() (it allocates - fragments)
+        # GATT handshake (stage 2)
+        self._hs = None            # in-flight ble_link.Handshake handle
+        self._invite_peer = None   # peer we're challenging / who's challenging us
+        self._my_nonce = 0         # our nonce this handshake (seed = ours ^ theirs)
+        self._decline_addr = None  # briefly ignore re-invites from a declined peer
+        self._decline_ms = 0.0
         # Register our OWN button handler (the proven app_components.Menu pattern)
         # rather than relying on EMFMon delegating - held ref so we can remove it.
         self._input_handler = self._handle_input
@@ -256,6 +263,7 @@ class Battle:
         if self.ble is not None:
             try:
                 self.ble.stop()
+                self.ble.cancel_handshake()
             except Exception as e:
                 print("Battle: ble stop:", e)
         try:
@@ -307,6 +315,49 @@ class Battle:
         self._flash_my = 0.0
         self._flash_opp = 0.0
         self.state = "anim"
+
+    # --- handshake wire format --------------------------------------------
+    # 17 bytes: name[8] shape[1] rgb[3] str[1] nonce[4]. With the 1-byte tag the
+    # write is 18B - this MUST stay <=20 (default ATT MTU 23 - 3) or writes
+    # silently truncate. Growing this format requires an MTU exchange first.
+    _STATS_FMT = "<8sBBBBBI"
+
+    def _pack_stats(self, nonce):
+        pet = self.app.pet
+        name = _clean_name(pet.get("name", "???")).encode()[:8]
+        name = name + b"\x00" * (8 - len(name))
+        shape = _clean_shape(pet.get("shape", "circle"))
+        shape_idx = SHAPES.index(shape) if shape in SHAPES else SHAPES.index("circle")
+        try:
+            r, g, b = (min(255, max(0, int(c * 255)))
+                       for c in pet.get("colour", [0.6, 0.6, 0.6])[:3])
+        except Exception:
+            r, g, b = 153, 153, 153
+        strv = _clean_strength(pet.get("strength", 5))
+        return struct.pack(self._STATS_FMT, name, shape_idx, r, g, b,
+                           strv, nonce & 0xFFFFFFFF)
+
+    def _unpack_stats(self, blob):
+        """Decode + SANITISE an opponent's stats blob (untrusted wire data).
+        Returns a dict, or None if malformed."""
+        try:
+            name_b, shape_idx, r, g, b, strv, nonce = struct.unpack(
+                self._STATS_FMT, bytes(blob)[:struct.calcsize(self._STATS_FMT)]
+            )
+        except Exception:
+            return None
+        try:
+            name = name_b.rstrip(b"\x00").decode()
+        except Exception:
+            name = ""
+        shape = SHAPES[shape_idx] if shape_idx < len(SHAPES) else "circle"
+        return {
+            "name": _clean_name(name),
+            "shape": _clean_shape(shape),
+            "colour": [r / 255.0, g / 255.0, b / 255.0],
+            "strength": _clean_strength(strv),
+            "nonce": nonce & 0xFFFFFFFF,
+        }
 
     def _apply_result(self):
         rec = self.records
@@ -364,6 +415,8 @@ class Battle:
         st = self.state
         if st == "searching":
             self._update_searching(delta)
+        elif st == "handshaking":
+            self._update_handshaking(delta)
         elif st == "anim":
             self._update_anim(delta)
 
@@ -380,6 +433,16 @@ class Battle:
         n = len(self._peers)
         if self.peer_idx >= n:
             self.peer_idx = max(0, n - 1)
+        # Someone challenging us? (a fresh invite beacon addressed to this badge)
+        if self._decline_ms > 0.0:
+            self._decline_ms = max(0.0, self._decline_ms - delta)
+        if self.ble is not None:
+            inv = self.ble.pending_invite()
+            if inv is not None and not (
+                self._decline_ms > 0.0 and inv["addr"] == self._decline_addr
+            ):
+                self._invite_peer = inv
+                self.state = "invited"
 
     def _update_anim(self, delta):
         self.anim_t += delta
@@ -424,6 +487,11 @@ class Battle:
             self._menu_button(event)
         elif st == "searching":
             self._searching_button(event)
+        elif st == "invited":
+            self._invited_button(event)
+        elif st == "handshaking":
+            if BUTTON_TYPES["CANCEL"] in event.button:
+                self._abort_handshake("Cancelled")
         elif st == "info":
             if _any_button(event):  # terminal screen - any key dismisses
                 self.state = "menu"
@@ -443,9 +511,11 @@ class Battle:
             if _any_button(event):
                 self.opp = None
                 self.state = "menu"
-        # a brief lockout when we land on a menu, so a late second press from
-        # mashing "any key" can't immediately trigger a menu selection
-        if self.state != st and self.state in ("menu", "records"):
+        # Whenever a button just moved us to a NEW screen, briefly ignore input
+        # so the same physical press (or a bounce/double-tap) can't blow through
+        # the screen we just landed on. This is what makes the gate-reason info
+        # screen ("must be fully healed", etc) linger instead of flashing past.
+        if self.state != st:
             self._input_lock = 250.0
 
     def _finish_anim(self):
@@ -502,10 +572,116 @@ class Battle:
         elif BUTTON_TYPES["CONFIRM"] in event.button:
             if peers:
                 peer = peers[self.peer_idx % len(peers)]
-                # STAGE 1: discovery only. The BLE GATT invite/accept/stats
-                # handshake is the next stage; for now confirm we found them.
-                self.message = "Found " + peer["name"] + "!\nBattle handshake\ncoming next."
-                self._leave_searching("info")
+                self._start_invite(peer)
+
+    # --- GATT handshake (stage 2) -----------------------------------------
+    def _start_invite(self, peer):
+        """Challenger: go connectable + invite this peer, then swap stats."""
+        if not self._handshake_ready():
+            return
+        self._invite_peer = peer
+        self._my_nonce = random.getrandbits(32)
+        self.my_str = _clean_strength(self.app.pet.get("strength", 5))
+        blob = self._pack_stats(self._my_nonce)
+        # start_invite() stops discovery internally, then advertises the invite.
+        self._hs = self.ble.start_invite(peer, blob)
+        self.message = "Challenging\n" + peer.get("name", "???") + "..."
+        self.state = "handshaking"
+
+    def _invited_button(self, event):
+        if BUTTON_TYPES["CANCEL"] in event.button:
+            # Decline: briefly ignore this peer, resume searching.
+            peer = self._invite_peer
+            if peer is not None:
+                self._decline_addr = peer.get("addr")
+                # Suppress longer than the challenger's 15s invite window so a
+                # declined invite can't immediately re-pop while it's still live.
+                self._decline_ms = 16000.0
+            self._invite_peer = None
+            if self.ble is not None:
+                self.ble.clear_invite()
+            self.state = "searching"
+        elif BUTTON_TYPES["CONFIRM"] in event.button:
+            self._accept_invite()
+
+    def _accept_invite(self):
+        """Acceptor: connect to the challenger and swap stats."""
+        peer = self._invite_peer
+        if peer is None:
+            self.state = "searching"
+            return
+        if self.ble is not None:
+            self.ble.clear_invite()
+        if not self._handshake_ready():
+            return
+        self._my_nonce = random.getrandbits(32)
+        self.my_str = _clean_strength(self.app.pet.get("strength", 5))
+        blob = self._pack_stats(self._my_nonce)
+        self._hs = self.ble.start_accept(peer, blob)
+        self.message = "Connecting to\n" + peer.get("name", "???") + "..."
+        self.state = "handshaking"
+
+    def _handshake_ready(self):
+        """Gate + BLE availability check shared by invite/accept. On failure it
+        parks on an info screen (stopping discovery) and returns False."""
+        if self.ble is None:
+            self.message = "Bluetooth not\navailable here."
+            self._leave_searching("info")
+            return False
+        reason = self._gate_reason()
+        if reason is not None:
+            self.message = reason
+            self._leave_searching("info")
+            return False
+        return True
+
+    def _update_handshaking(self, delta):
+        hs = self._hs
+        if hs is None:
+            self._abort_handshake("Link error")
+        elif hs.status == "exchanged":
+            self._on_exchange_done(hs)
+        elif hs.status == "failed":
+            self._abort_handshake(hs.error or "Lost them!")
+
+    def _on_exchange_done(self, hs):
+        stats = self._unpack_stats(hs.peer_blob)
+        if stats is None:
+            self._abort_handshake("Bad data")
+            return
+        my_n = self._my_nonce & 0xFFFFFFFF
+        peer_n = stats["nonce"] & 0xFFFFFFFF
+        seed = (my_n ^ peer_n) & 0xFFFFFFFF
+        # Order the two players by their EXCHANGED NONCES (both badges hold the
+        # exact same pair) rather than by BLE address. This makes the winner
+        # identical on both badges BY CONSTRUCTION - no dependency on the
+        # controller presenting the same address over-air as config('mac')
+        # returns. (Equal nonces = 1/2^32, negligible.)
+        my_id = struct.pack("<I", my_n)
+        peer_id = struct.pack("<I", peer_n)
+        self.opp = {
+            "name": stats["name"],
+            "shape": stats["shape"],
+            "colour": stats["colour"],
+            "strength": stats["strength"],
+            "id": hs.peer_addr,     # informational only (resolve uses nonces)
+        }
+        self.is_practice = False   # networked = ranked (HP + W/L cost)
+        self.i_won = resolve(my_id, self.my_str, peer_id, stats["strength"], seed)
+        self._hs = None
+        self._invite_peer = None
+        self._begin_anim()
+
+    def _abort_handshake(self, msg):
+        if self.ble is not None:
+            try:
+                self.ble.cancel_handshake()
+            except Exception as e:
+                print("Battle: hs cancel:", e)
+        self._hs = None
+        self._invite_peer = None
+        self.message = msg + "\nStay close, retry."
+        self.state = "info"
 
     _REC_ROWS = 6  # ranked-log rows visible at once
 
@@ -552,6 +728,10 @@ class Battle:
             self._draw_rec_practice(ctx)
         elif st == "searching":
             self._draw_searching(ctx)
+        elif st == "invited":
+            self._draw_invited(ctx)
+        elif st == "handshaking":
+            self._draw_handshaking(ctx)
         elif st in ("anim", "result"):
             self._draw_battle(ctx)
 
@@ -694,6 +874,29 @@ class Battle:
             ctx.text_align = ctx.CENTER
             ctx.font_size = 11
             ctx.rgb(0.6, 0.6, 0.6).move_to(0, 98).text("C: challenge   F: back")
+
+    def _draw_invited(self, ctx):
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        peer = self._invite_peer or {}
+        ctx.font_size = 20
+        ctx.rgb(0.9, 0.7, 0.1).move_to(0, -50).text("CHALLENGE!")
+        ctx.font_size = 16
+        set_color(ctx, "label")
+        ctx.move_to(0, -14).text(str(peer.get("name", "???")))
+        ctx.move_to(0, 10).text("wants to battle")
+        ctx.font_size = 12
+        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 96).text("C: accept   F: decline")
+
+    def _draw_handshaking(self, ctx):
+        ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
+        set_color(ctx, "label")
+        ctx.font_size = 16
+        for i, line in enumerate(self.message.split("\n")):
+            ctx.move_to(0, -14 + i * 22).text(line)
+        ctx.font_size = 12
+        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 96).text("F: cancel")
 
     def _draw_battle(self, ctx):
         pet = self.app.pet
