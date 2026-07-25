@@ -370,6 +370,8 @@ class Battle:
             self._save_records()
             return
         pet = self.app.pet
+        if not pet.get("alive", True):
+            return   # pet died mid-handshake - don't apply a ranked HP/W-L result
         pet["health"] = WIN_HEALTH if self.i_won else LOSE_HEALTH
         if self.i_won:
             rec["w"] += 1
@@ -399,6 +401,8 @@ class Battle:
         self._search_t = 0.0
         self._peer_refresh = 0.0
         self._peers = []
+        self._decline_addr = None    # fresh session: don't carry a stale suppress
+        self._decline_ms = 0.0
         if self.ble is not None:
             self.ble.start_discovery()
         self.state = "searching"
@@ -415,6 +419,8 @@ class Battle:
         st = self.state
         if st == "searching":
             self._update_searching(delta)
+        elif st == "invited":
+            self._update_invited(delta)
         elif st == "handshaking":
             self._update_handshaking(delta)
         elif st == "anim":
@@ -428,7 +434,18 @@ class Battle:
         self._peer_refresh += delta
         if self.ble is not None and self._peer_refresh >= 400:
             self._peer_refresh = 0.0
+            # Remember which badge is highlighted so the selection tracks the
+            # SAME peer across RSSI reshuffles/evictions (index isn't identity -
+            # otherwise a reshuffle could make CONFIRM challenge the wrong badge).
+            sel_addr = None
+            if 0 <= self.peer_idx < len(self._peers):
+                sel_addr = self._peers[self.peer_idx].get("addr")
             self._peers = self.ble.peer_list()   # closest (strongest) first
+            if sel_addr is not None:
+                for i, p in enumerate(self._peers):
+                    if p.get("addr") == sel_addr:
+                        self.peer_idx = i
+                        break
             gc.collect()                          # keep the heap tidy
         n = len(self._peers)
         if self.peer_idx >= n:
@@ -588,6 +605,14 @@ class Battle:
         self.message = "Challenging\n" + peer.get("name", "???") + "..."
         self.state = "handshaking"
 
+    def _update_invited(self, delta):
+        # Auto-dismiss the CHALLENGE! popup if the challenger stops advertising
+        # (walks away / gives up). Discovery is still running here, so a stale
+        # invite means they're gone - drop back to the peer list.
+        if self.ble is not None and self.ble.pending_invite() is None:
+            self._invite_peer = None
+            self.state = "searching"
+
     def _invited_button(self, event):
         if BUTTON_TYPES["CANCEL"] in event.button:
             # Decline: briefly ignore this peer, resume searching.
@@ -651,6 +676,13 @@ class Battle:
             return
         my_n = self._my_nonce & 0xFFFFFFFF
         peer_n = stats["nonce"] & 0xFFFFFFFF
+        # Equal nonces would make BOTH badges order themselves the same way
+        # (neither is "lo") -> they'd disagree on the winner, and seed=0 hits the
+        # xorshift constant fallback. Astronomically rare for honest badges
+        # (1/2^32) but a malicious peer could force it: reject and abort.
+        if my_n == peer_n:
+            self._abort_handshake("Bad data")
+            return
         seed = (my_n ^ peer_n) & 0xFFFFFFFF
         # Order the two players by their EXCHANGED NONCES (both badges hold the
         # exact same pair) rather than by BLE address. This makes the winner

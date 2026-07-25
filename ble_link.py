@@ -174,7 +174,7 @@ class BleLink:
     def peer_list(self):
         """Nearby badges, closest (strongest signal) first."""
         self._prune()
-        return sorted(self.peers.values(), key=lambda p: -(p.get("rssi") or -999))
+        return sorted(self.peers.values(), key=lambda p: -_rssi_key(p.get("rssi")))
 
     def _prune(self):
         now = _ticks_ms()
@@ -189,8 +189,8 @@ class BleLink:
             # one is at least as strong - so a flood of weak spoofed adverts
             # can't push out the real, close badges. Bounds the dict at _MAX_PEERS.
             weakest = min(self.peers,
-                          key=lambda k: (self.peers[k].get("rssi") or -999))
-            if (rssi or -999) <= (self.peers[weakest].get("rssi") or -999):
+                          key=lambda k: _rssi_key(self.peers[k].get("rssi")))
+            if _rssi_key(rssi) <= _rssi_key(self.peers[weakest].get("rssi")):
                 return
             del self.peers[weakest]
         self.peers[addr] = {
@@ -461,6 +461,12 @@ class BleLink:
                     await conn.disconnect()
                 except Exception:
                     pass
+
+
+def _rssi_key(rssi):
+    # sort/eviction key: unknown RSSI (None) sorts weakest. Real BLE RSSI is
+    # negative dBm, so an actual 0 never occurs here.
+    return -999 if rssi is None else rssi
 
 
 def _short_err(e):
