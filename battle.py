@@ -886,6 +886,8 @@ class Battle:
                     ("No badges nearby.", "They must also be", "in 'Find opponent'.")
                 ):
                     ctx.move_to(0, 6 + i * 18).text(line)
+            ctx.font_size = 11
+            ctx.rgb(0.6, 0.6, 0.6).move_to(0, 98).text("F: back")
         else:
             # scroll a 5-row window so the highlighted peer is always visible
             start = 0
