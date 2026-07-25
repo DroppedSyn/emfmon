@@ -287,9 +287,30 @@ def _get_alert_icon():
 _active_mon = None
 
 
+def _log_reset_cause():
+    # TEMP DIAGNOSTIC: record why the badge last reset, so a crash on the BLE
+    # search screen tells us watchdog vs panic vs brownout (see resetlog.txt).
+    try:
+        import machine
+        rc = machine.reset_cause()
+        names = {
+            getattr(machine, "PWRON_RESET", -1): "PWRON",
+            getattr(machine, "HARD_RESET", -2): "HARD/panic?",
+            getattr(machine, "WDT_RESET", -3): "WDT",
+            getattr(machine, "DEEPSLEEP_RESET", -4): "DEEPSLEEP",
+            getattr(machine, "SOFT_RESET", -5): "SOFT",
+            getattr(machine, "BROWNOUT_RESET", -6): "BROWNOUT",
+        }
+        with open("/apps/emfmon/resetlog.txt", "a") as f:
+            f.write("cause=%d (%s)\n" % (rc, names.get(rc, "?")))
+    except Exception as e:
+        print("resetlog:", e)
+
+
 class EMFMon(app.App):
     def __init__(self):
         super().__init__()
+        _log_reset_cause()  # TEMP: diagnose the BLE search-screen reboot
         # Claim the active slot so any older instance left running in the
         # background (see _active_mon) stops simulating and saving.
         global _active_mon

@@ -3,22 +3,26 @@
 OPTIONAL. The pet is fully functional without this module - app.py imports it
 lazily inside a try/except, so any failure here can never affect the core pet.
 
-Badge-to-badge battles run over ESP-NOW (the firmware's connectionless radio;
-no WiFi network required, but both badges must be on the same channel). A solo
-Practice mode works with one badge.
+Badge-to-badge battles use BLE (see ble_link.py) - it discovers peers on fixed
+advertising channels every device scans, so it works regardless of WiFi (unlike
+the old ESP-NOW transport, whose channel followed each badge's WiFi association
+and couldn't find peers in the field). A solo Practice mode works with one badge.
 
 Outcome is decided by a small strength nudge on a forgiving coin-flip:
-    P(lower-mac player wins) = clamp(0.5 + 0.04*(str_lo - str_hi), 0.25, 0.75)
-Both badges exchange stats + a random nonce, XOR the nonces into one shared
-seed, and each runs the SAME deterministic resolver + animation - so they agree
-on the winner with no server and no live frame-sync.
+    P(lower-id player wins) = clamp(0.5 + 0.04*(str_lo - str_hi), 0.25, 0.75)
+For a networked battle both badges share one seed and run the SAME deterministic
+resolver + animation, so they agree on the winner with no server.
 
-CRITICAL: the ESP-NOW receive handler is registered under the EMFMon app on the
-eventbus, and the bus KILLS the owning app if a handler raises. So _on_msg must
-never propagate an exception, and every field off the wire is untrusted and
-sanitised before use.
+CRITICAL: the ButtonDownEvent handler is registered under the EMFMon app on the
+eventbus, and the bus KILLS the owning app if a handler raises. So _handle_input
+must never propagate an exception.
+
+DISCOVERY (this stage): 'Find opponent' advertises EMFMon:<name> and scans,
+listing nearby searching badges closest-first. The GATT invite/accept/stats
+handshake is the next stage - challenging a peer currently shows a note.
 """
 
+import gc
 import json
 import math
 
@@ -43,15 +47,13 @@ except Exception:  # pragma: no cover - always present on-badge
     random = None
 
 try:
-    from system.espnow import BROADCAST_MAC, espnow_service
-    from system.espnow.events import EspNowReceiveEvent
-    _HAVE_ESPNOW = True
-except Exception:  # networking unavailable - Practice still works
-    _HAVE_ESPNOW = False
-    BROADCAST_MAC = b"\xff\xff\xff\xff\xff\xff"
+    from .ble_link import BleLink
+    _HAVE_BLE = True
+except Exception:  # BLE unavailable - Practice / Records still work
+    _HAVE_BLE = False
+    BleLink = None
 
 BATTLES_PATH = _DIR + "/battles.json"
-MAGIC = b"EMFB1"         # protocol tag/version; ignore anything not starting with it
 
 # --- outcome tuning --------------------------------------------------------
 STRENGTH_NUDGE = 0.04    # per point of strength difference
@@ -62,19 +64,8 @@ WIN_HEALTH = 75.0        # winner is knocked back to this
 LOSE_HEALTH = 25.0       # loser is knocked back to this
 MAX_LOG = 20             # battle history entries kept
 
-# --- networking timing (ms) ------------------------------------------------
-HELLO_MS = 900           # broadcast "here I am" while searching
-INVITE_MS = 700          # resend an invite while waiting for an answer
-STATS_MS = 350           # resend stats while exchanging (best-effort radio)
-PEER_STALE_MS = 4000     # forget a nearby badge not heard from in this long
-MAX_PEERS = 12           # cap the discovery list (guards against HELLO flooding)
-NO_PEERS_HINT_MS = 5000  # show the "same WiFi?" hint after searching this long
-INVITE_TIMEOUT_MS = 9000
-# keep <= INVITE_TIMEOUT so the invitee's prompt closes no later than the
-# inviter gives up (else a late accept lands on a peer who already bailed)
-INVITED_TIMEOUT_MS = 8000
-EXCHANGE_TIMEOUT_MS = 12000  # generous: best-effort radio needs retries to converge
-CONFIRM_TAIL_MS = 1500   # keep confirming stats this far into the animation
+# --- discovery -------------------------------------------------------------
+NO_PEERS_HINT_MS = 5000  # show a hint after searching this long with nobody found
 
 # --- animation timing (ms) -------------------------------------------------
 _INTRO_MS = 900
@@ -105,11 +96,11 @@ def _xorshift(seed):
     return nxt
 
 
-def resolve(my_mac, my_str, opp_mac, opp_str, seed):
-    """Return True if *I* win. Symmetric: run on both badges with the MACs
+def resolve(my_id, my_str, opp_id, opp_str, seed):
+    """Return True if *I* win. Symmetric: run on both badges with the ids
     swapped and the same seed, each gets the consistent result."""
     # tuple-of-ints comparison (MicroPython-safe; avoids relying on bytes '<')
-    i_am_lo = tuple(my_mac) < tuple(opp_mac)
+    i_am_lo = tuple(my_id) < tuple(opp_id)
     str_lo = my_str if i_am_lo else opp_str
     str_hi = opp_str if i_am_lo else my_str
     nxt = _xorshift(seed)
@@ -120,21 +111,11 @@ def resolve(my_mac, my_str, opp_mac, opp_str, seed):
     return lo_wins == i_am_lo
 
 
-# --- untrusted-input sanitisers (everything off the wire) ------------------
+# --- untrusted-input sanitisers (used now for names, and by the handshake) --
 def _clean_name(x):
     if isinstance(x, str) and x:
         return x[:8]
     return "???"
-
-
-def _clean_colour(c):
-    if (
-        isinstance(c, list)
-        and len(c) == 3
-        and all(isinstance(v, (int, float)) for v in c)
-    ):
-        return [min(1.0, max(0.0, float(v))) for v in c]
-    return [0.6, 0.6, 0.6]
 
 
 def _clean_strength(x):
@@ -219,10 +200,10 @@ def _load_records():
 
 
 class Battle:
-    """Owns the battle view: menu, records, discovery/handshake, and animation.
+    """Owns the battle view: menu, records, BLE discovery, and animation.
 
     States: menu | info | records | rec_ranked | rec_practice | searching |
-            inviting | invited | exchanging | anim | result
+            anim | result   (the GATT handshake will add its own).
     """
 
     def __init__(self, app):
@@ -237,11 +218,10 @@ class Battle:
         self.message = ""
         self.state = "menu"
         # per-battle
-        self.opp = None            # {"name","shape","colour","strength","mac"}
+        self.opp = None            # {"name","shape","colour","strength","id"}
         self.i_won = False
         self.is_practice = False   # practice is free: no HP change, no W/L
-        self.my_str = 5            # OWN strength, snapshotted per battle (see below)
-        self._invite_return = "menu"  # state to return to if an invite is declined
+        self.my_str = 5            # OWN strength, snapshotted per battle
         self._input_lock = 0.0     # brief button lockout after arriving at a menu
         self.anim_t = 0.0
         self.my_bar = 100.0
@@ -249,49 +229,19 @@ class Battle:
         self._hits_done = 0        # shots whose damage we've already applied
         self._flash_my = 0.0       # ms of hit-flash left on each bar
         self._flash_opp = 0.0
-        # networking
-        self.net = _HAVE_ESPNOW
-        self._sub = None
-        mac = _own_mac()
-        if mac is None:
-            # without our real STA MAC we can't order players consistently with a
-            # peer (they see our real MAC), so disable networked play - Practice
-            # only. The random id below is just a local placeholder for Practice.
-            self.net = False
-            mac = bytes(random.getrandbits(8) for _ in range(6))
-        self._own_mac = mac
-        self.peers = {}            # mac(bytes) -> {"name","seen"}
+        # a stable local id (for Practice's resolve ordering; networked battles
+        # will use the real BLE address). Random per session is fine.
+        self._own_id = bytes(random.getrandbits(8) for _ in range(6))
+        # BLE discovery
+        self.ble = BleLink(self._my_name()) if _HAVE_BLE else None
+        self._peers = []           # cached closest-first list while searching
         self.peer_idx = 0
-        self.engaged_mac = None    # peer we're inviting / invited-by / exchanging
-        self.engaged_name = ""
-        self.my_nonce = 0
-        self.peer_stats = None     # sanitised {"name","shape","colour","strength","nonce"}
-        self.peer_has_mine = False
         self._search_t = 0.0
-        self._send_t = 0.0
-        self._to_t = 0.0
+        self._peer_refresh = 0.0   # throttle peer_list() (it allocates - fragments)
         # Register our OWN button handler (the proven app_components.Menu pattern)
         # rather than relying on EMFMon delegating - held ref so we can remove it.
-        # ESP-NOW is subscribed LAZILY (only when you pick Find opponent), so
-        # Practice/Records never touch the radio.
         self._input_handler = self._handle_input
         eventbus.on_async(ButtonDownEvent, self._input_handler, self.app)
-
-    def _ensure_net(self):
-        # bring up the ESP-NOW listener on demand (keeps the radio asleep for
-        # Practice/menu; returns True if networking is available)
-        if not self.net:
-            return False
-        if self._sub is None:
-            try:
-                self._sub = espnow_service.subscribe(
-                    self._on_msg, self.app, predicate=_is_battle_msg
-                )
-            except Exception as e:
-                print("Battle: espnow subscribe failed:", e)
-                self.net = False
-                return False
-        return True
 
     # --- input handler (own eventbus registration) -------------------------
     async def _handle_input(self, event):
@@ -303,18 +253,15 @@ class Battle:
 
     # --- lifecycle ---------------------------------------------------------
     def close(self):
-        if self.engaged_mac is not None:
-            self._send(self.engaged_mac, {"t": "X"})  # let the peer bail early
+        if self.ble is not None:
+            try:
+                self.ble.stop()
+            except Exception as e:
+                print("Battle: ble stop:", e)
         try:
             eventbus.remove(ButtonDownEvent, self._input_handler, self.app)
         except Exception as e:
             print("Battle: input unsubscribe failed:", e)
-        if self._sub is not None:
-            try:
-                eventbus.remove(EspNowReceiveEvent, self._sub, self.app)
-            except Exception as e:
-                print("Battle: unsubscribe failed:", e)
-            self._sub = None
 
     def _my_name(self):
         return _clean_name(self.app.pet.get("name", "???"))
@@ -329,85 +276,6 @@ class Battle:
             return "Must be FULLY\nHEALED to battle."
         return None
 
-    # --- networking send + receive ----------------------------------------
-    def _send(self, mac, obj):
-        if not self.net:
-            return
-        try:
-            espnow_service.send(MAGIC + bytes(json.dumps(obj), "utf-8"), mac)
-        except Exception as e:
-            print("Battle: send failed:", e)
-
-    def _send_stats(self):
-        pet = self.app.pet
-        self._send(self.engaged_mac, {
-            "t": "S",
-            "n": self._my_name(),
-            "sh": pet.get("shape", "circle"),
-            "c": [round(float(v), 3) for v in pet.get("colour", [0.6, 0.6, 0.6])],
-            "st": self.my_str,   # snapshotted at _start_exchange (determinism)
-            "nc": self.my_nonce,
-            "gy": self.peer_stats is not None,  # "got yours"
-        })
-
-    def _on_msg(self, event):
-        # BULLETPROOF: the eventbus stops the owning app if a handler raises.
-        try:
-            self._handle(event)
-        except Exception as e:
-            print("Battle: msg error:", e)
-
-    def _handle(self, event):
-        mac = bytes(event.mac)
-        if mac == self._own_mac:
-            return
-        obj = json.loads(event.msg[len(MAGIC):].decode())
-        if not isinstance(obj, dict):
-            return
-        t = obj.get("t")
-        if t == "H":  # a nearby badge advertising
-            # only while actively searching, and capped so a flood of spoofed
-            # HELLOs can't grow the dict without bound (aged in _update_searching)
-            if self.state == "searching" and (
-                mac in self.peers or len(self.peers) < MAX_PEERS
-            ):
-                self.peers[mac] = {"name": _clean_name(obj.get("n")), "seen": 0.0}
-            return
-        if t == "I":  # invite
-            if self.state in ("menu", "searching"):
-                self._invite_return = self.state  # go back here if we decline
-                self.engaged_mac = mac
-                self.engaged_name = _clean_name(obj.get("n"))
-                self._to_t = 0.0
-                self.state = "invited"
-            elif self.state == "inviting" and mac == self.engaged_mac:
-                self._start_exchange()  # mutual invite - both want it
-            return
-        # remaining message types only from the peer we're engaged with
-        if self.engaged_mac is None or mac != self.engaged_mac:
-            return
-        if t == "A":  # accept
-            if self.state == "inviting":
-                self._start_exchange()
-        elif t == "N":  # decline
-            if self.state == "inviting":
-                self.message = self.engaged_name + "\ndeclined."
-                self._end_session("info")
-        elif t == "S":  # stats
-            if self.state == "exchanging":
-                self._recv_stats(obj)
-            elif self.state == "inviting":
-                # I invited them, so I've already consented; their ACCEPT may have
-                # been lost but their stats prove they accepted, so proceed. We
-                # NEVER auto-start from "invited" - that side must press Accept.
-                self._start_exchange()
-                if self.state == "exchanging":
-                    self._recv_stats(obj)
-        elif t == "X":  # peer left / aborted
-            if self.state in ("inviting", "invited", "exchanging"):
-                self.message = self.engaged_name + "\nleft."
-                self._end_session("info")
-
     # --- battle setup ------------------------------------------------------
     def _start_practice(self):
         reason = self._gate_reason()
@@ -415,69 +283,21 @@ class Battle:
             self.message = reason
             self.state = "info"
             return
-        opp_mac = bytes(random.getrandbits(8) for _ in range(6))
+        opp_id = bytes(random.getrandbits(8) for _ in range(6))
         self.opp = {
             "name": _random_name(),
             "shape": random.choice(SHAPES),
             "colour": _random_colour(),
             "strength": random.randint(2, 9),
-            "mac": opp_mac,
+            "id": opp_id,
         }
         self.my_str = _clean_strength(self.app.pet.get("strength", 5))
         seed = random.getrandbits(32)
-        self.engaged_mac = None  # practice: no live peer to confirm with
         self.is_practice = True  # free: no HP change, no record
         self.i_won = resolve(
-            self._own_mac, self.my_str, opp_mac, self.opp["strength"], seed
+            self._own_id, self.my_str, opp_id, self.opp["strength"], seed
         )
         self._begin_anim()
-
-    def _start_exchange(self):
-        if self.state == "exchanging":
-            return
-        reason = self._gate_reason()  # re-check my own eligibility
-        if reason is not None:
-            self._send(self.engaged_mac, {"t": "X"})
-            self.message = reason
-            self._end_session("info")
-            return
-        self.my_nonce = random.getrandbits(30)
-        # snapshot own strength ALONGSIDE the nonce so a fitness tick mid-exchange
-        # can't make the two badges resolve with different strengths (both send
-        # AND resolve from this frozen value)
-        self.my_str = _clean_strength(self.app.pet.get("strength", 5))
-        self.peer_stats = None
-        self.peer_has_mine = False
-        self.is_practice = False  # a real, networked battle - counts + costs HP
-        self._send_t = 0.0
-        self._to_t = 0.0
-        self.state = "exchanging"
-
-    def _recv_stats(self, obj):
-        if self.peer_stats is None:
-            self.peer_stats = {
-                "name": _clean_name(obj.get("n")),
-                "shape": _clean_shape(obj.get("sh")),
-                "colour": _clean_colour(obj.get("c")),
-                "strength": _clean_strength(obj.get("st")),
-                "nonce": _clean_nonce(obj.get("nc")),
-            }
-        self.peer_has_mine = bool(obj.get("gy"))
-        # resolve once BOTH badges hold both nonces (I have theirs; they have mine)
-        if self.peer_stats is not None and self.peer_has_mine:
-            seed = (self.my_nonce ^ self.peer_stats["nonce"]) & 0xFFFFFFFF
-            self.opp = {
-                "name": self.peer_stats["name"],
-                "shape": self.peer_stats["shape"],
-                "colour": self.peer_stats["colour"],
-                "strength": self.peer_stats["strength"],
-                "mac": self.engaged_mac,
-            }
-            self.i_won = resolve(
-                self._own_mac, self.my_str, self.engaged_mac,
-                self.peer_stats["strength"], seed,
-            )
-            self._begin_anim()  # keeps engaged_mac so we tail-confirm to the peer
 
     def _begin_anim(self):
         self.anim_t = 0.0
@@ -486,25 +306,7 @@ class Battle:
         self._hits_done = 0
         self._flash_my = 0.0
         self._flash_opp = 0.0
-        self._send_t = 0.0
         self.state = "anim"
-
-    def _enter_searching(self):
-        # always reset discovery state so we never show a stale peer list
-        self.peers = {}
-        self.peer_idx = 0
-        self._search_t = 0.0
-        self._send_t = HELLO_MS  # broadcast immediately
-        self.state = "searching"
-
-    def _end_session(self, new_state):
-        self.engaged_mac = None
-        self.engaged_name = ""
-        self.peer_stats = None
-        self.peer_has_mine = False
-        self._to_t = 0.0
-        self._send_t = 0.0
-        self.state = new_state
 
     def _apply_result(self):
         rec = self.records
@@ -540,6 +342,21 @@ class Battle:
         except Exception as e:
             print("Battle: save records failed:", e)
 
+    # --- discovery ---------------------------------------------------------
+    def _enter_searching(self):
+        self.peer_idx = 0
+        self._search_t = 0.0
+        self._peer_refresh = 0.0
+        self._peers = []
+        if self.ble is not None:
+            self.ble.start_discovery()
+        self.state = "searching"
+
+    def _leave_searching(self, new_state):
+        if self.ble is not None:
+            self.ble.stop()
+        self.state = new_state
+
     # --- update ------------------------------------------------------------
     def update(self, delta):
         if self._input_lock > 0.0:
@@ -547,53 +364,24 @@ class Battle:
         st = self.state
         if st == "searching":
             self._update_searching(delta)
-        elif st == "inviting":
-            self._to_t += delta
-            self._send_t += delta
-            if self._send_t >= INVITE_MS:
-                self._send_t = 0.0
-                self._send(self.engaged_mac, {"t": "I", "n": self._my_name()})
-            if self._to_t >= INVITE_TIMEOUT_MS:
-                self.message = "No answer.\nSame WiFi? Move\ncloser & retry."
-                self._end_session("info")
-        elif st == "invited":
-            self._to_t += delta
-            if self._to_t >= INVITED_TIMEOUT_MS:
-                self._end_session(self._invite_return)  # prompt expired
-        elif st == "exchanging":
-            self._to_t += delta
-            self._send_t += delta
-            if self._send_t >= STATS_MS:
-                self._send_t = 0.0
-                self._send_stats()
-            if self._to_t >= EXCHANGE_TIMEOUT_MS:
-                self._send(self.engaged_mac, {"t": "X"})
-                self.message = "Lost them!\nStay close, same\nWiFi, rematch."
-                self._end_session("info")
         elif st == "anim":
             self._update_anim(delta)
 
     def _update_searching(self, delta):
         self._search_t += delta
-        self._send_t += delta
-        for m in list(self.peers.keys()):        # age out stale badges
-            self.peers[m]["seen"] += delta
-            if self.peers[m]["seen"] > PEER_STALE_MS:
-                del self.peers[m]
-        if self._send_t >= HELLO_MS:
-            self._send_t = 0.0
-            self._send(BROADCAST_MAC, {"t": "H", "n": self._my_name()})
-        n = len(self.peers)
+        # refresh the peer list only a few times a second (not every frame) -
+        # peer_list() allocates a fresh sorted list and pruning the dict, and
+        # doing that 60x/s fragmented the heap into an OOM reboot after minutes
+        self._peer_refresh += delta
+        if self.ble is not None and self._peer_refresh >= 400:
+            self._peer_refresh = 0.0
+            self._peers = self.ble.peer_list()   # closest (strongest) first
+            gc.collect()                          # keep the heap tidy
+        n = len(self._peers)
         if self.peer_idx >= n:
             self.peer_idx = max(0, n - 1)
 
     def _update_anim(self, delta):
-        # tail-confirm stats so the peer also converges (networked battles only)
-        if self.engaged_mac is not None and self.anim_t < CONFIRM_TAIL_MS:
-            self._send_t += delta
-            if self._send_t >= STATS_MS:
-                self._send_t = 0.0
-                self._send_stats()
         self.anim_t += delta
         self._flash_my = max(0.0, self._flash_my - delta)
         self._flash_opp = max(0.0, self._flash_opp - delta)
@@ -622,7 +410,6 @@ class Battle:
         else:
             self.my_bar, self.opp_bar = loser_bar, winner_bar
         if self.anim_t >= _ANIM_MS:
-            self.engaged_mac = None  # battle over; stop talking to the peer
             self._apply_result()
             self.state = "result"
 
@@ -637,21 +424,6 @@ class Battle:
             self._menu_button(event)
         elif st == "searching":
             self._searching_button(event)
-        elif st == "invited":
-            if BUTTON_TYPES["CONFIRM"] in event.button:
-                self._send(self.engaged_mac, {"t": "A", "n": self._my_name()})
-                self._start_exchange()
-            elif BUTTON_TYPES["CANCEL"] in event.button:
-                self._send(self.engaged_mac, {"t": "N"})
-                self._end_session(self._invite_return)
-        elif st == "inviting":
-            if BUTTON_TYPES["CANCEL"] in event.button:
-                self._send(self.engaged_mac, {"t": "X"})
-                self._end_session("searching")
-        elif st == "exchanging":
-            if BUTTON_TYPES["CANCEL"] in event.button:
-                self._send(self.engaged_mac, {"t": "X"})
-                self._end_session("searching")
         elif st == "info":
             if _any_button(event):  # terminal screen - any key dismisses
                 self.state = "menu"
@@ -663,9 +435,9 @@ class Battle:
             if _any_button(event):
                 self.state = "records"
         elif st == "anim":
-            # only allow skipping a solo Practice battle - skipping a networked
-            # one could desync the peer's result, so let it play out
-            if self.engaged_mac is None and BUTTON_TYPES["CANCEL"] in event.button:
+            # Practice battles can be skipped; a networked one (later) must play
+            # out so the peer's result stays in sync.
+            if self.is_practice and BUTTON_TYPES["CANCEL"] in event.button:
                 self._finish_anim()
         elif st == "result":
             if _any_button(event):
@@ -701,8 +473,8 @@ class Battle:
         if item == "Practice":
             self._start_practice()
         elif item == "Find opponent":
-            if not self._ensure_net():
-                self.message = "Networking off\non this badge."
+            if self.ble is None:
+                self.message = "Bluetooth not\navailable here."
                 self.state = "info"
                 return
             reason = self._gate_reason()
@@ -718,27 +490,22 @@ class Battle:
             self.done = True
 
     def _searching_button(self, event):
-        macs = self._peer_list()
+        peers = self._peers
         if BUTTON_TYPES["CANCEL"] in event.button:
-            self.state = "menu"
+            self._leave_searching("menu")
         elif BUTTON_TYPES["UP"] in event.button:
-            if macs:
-                self.peer_idx = (self.peer_idx - 1) % len(macs)
+            if peers:
+                self.peer_idx = (self.peer_idx - 1) % len(peers)
         elif BUTTON_TYPES["DOWN"] in event.button:
-            if macs:
-                self.peer_idx = (self.peer_idx + 1) % len(macs)
+            if peers:
+                self.peer_idx = (self.peer_idx + 1) % len(peers)
         elif BUTTON_TYPES["CONFIRM"] in event.button:
-            if macs:
-                mac = macs[self.peer_idx % len(macs)]
-                self.engaged_mac = mac
-                self.engaged_name = self.peers[mac]["name"]
-                self._to_t = 0.0
-                self._send_t = INVITE_MS  # send invite immediately
-                self.state = "inviting"
-
-    def _peer_list(self):
-        # stable, deterministic order (MicroPython dicts are NOT insertion-ordered)
-        return sorted(self.peers.keys(), key=lambda m: tuple(m))
+            if peers:
+                peer = peers[self.peer_idx % len(peers)]
+                # STAGE 1: discovery only. The BLE GATT invite/accept/stats
+                # handshake is the next stage; for now confirm we found them.
+                self.message = "Found " + peer["name"] + "!\nBattle handshake\ncoming next."
+                self._leave_searching("info")
 
     _REC_ROWS = 6  # ranked-log rows visible at once
 
@@ -785,12 +552,6 @@ class Battle:
             self._draw_rec_practice(ctx)
         elif st == "searching":
             self._draw_searching(ctx)
-        elif st == "inviting":
-            self._draw_waiting(ctx, "Inviting", self.engaged_name)
-        elif st == "invited":
-            self._draw_invited(ctx)
-        elif st == "exchanging":
-            self._draw_waiting(ctx, "Battling", self.engaged_name)
         elif st in ("anim", "result"):
             self._draw_battle(ctx)
 
@@ -808,7 +569,6 @@ class Battle:
             else:
                 set_color(ctx, "label")
                 ctx.move_to(0, y).text(item)
-        # control hint - the A/D petals move, C selects, F exits
         ctx.font_size = 11
         ctx.rgb(0.6, 0.6, 0.6).move_to(0, 96).text("A/D move  C pick  F back")
 
@@ -824,7 +584,6 @@ class Battle:
         ctx.rgb(0.6, 0.6, 0.6).move_to(0, 90).text("any key")
 
     def _draw_records(self, ctx):
-        # submenu: choose which record to view
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         set_color(ctx, "label")
@@ -898,67 +657,43 @@ class Battle:
         ctx.font_size = 17
         ctx.move_to(0, -96).text("Find opponent")
         ctx.font_size = 11
-        ch = _wifi_channel()
-        ctx.rgb(0.55, 0.55, 0.6).move_to(0, -78).text(
-            "WiFi ch %s" % (ch if ch is not None else "-")
-        )
-        macs = self._peer_list()
-        if not macs:
+        ctx.rgb(0.35, 0.55, 0.95).move_to(0, -78).text("via Bluetooth")
+        # TEMP diagnostic: free heap in KB - watch if it declines (leak) or
+        # holds then reboots (fragmentation)
+        ctx.font_size = 9
+        ctx.rgb(0.45, 0.45, 0.5).move_to(0, -64).text("mem %dk" % (gc.mem_free() // 1024))
+        peers = self._peers
+        if not peers:
             ctx.font_size = 14
             set_color(ctx, "label")
             ctx.move_to(0, -30).text("Searching...")
             if self._search_t >= NO_PEERS_HINT_MS:
-                ctx.font_size = 13
+                ctx.font_size = 12
                 ctx.rgb(0.9, 0.7, 0.1)
                 for i, line in enumerate(
-                    ("No badges nearby.", "Both on the same", "WiFi? (or both off)")
+                    ("No badges nearby.", "They must also be", "in 'Find opponent'.")
                 ):
                     ctx.move_to(0, 6 + i * 18).text(line)
         else:
-            ctx.font_size = 14
             # scroll a 5-row window so the highlighted peer is always visible
             start = 0
-            if len(macs) > 5:
-                start = min(max(0, self.peer_idx - 2), len(macs) - 5)
-            for row, mac in enumerate(macs[start:start + 5]):
+            if len(peers) > 5:
+                start = min(max(0, self.peer_idx - 2), len(peers) - 5)
+            for row, peer in enumerate(peers[start:start + 5]):
                 idx = start + row
-                y = -46 + row * 22
-                name = self.peers[mac]["name"]
-                if idx == self.peer_idx:
-                    ctx.rgb(0.9, 0.7, 0.1).move_to(0, y).text("> " + name + " <")
+                y = -48 + row * 22
+                sel = idx == self.peer_idx
+                ctx.text_align = ctx.LEFT
+                ctx.font_size = 14
+                if sel:
+                    ctx.rgb(0.9, 0.7, 0.1)
                 else:
                     set_color(ctx, "label")
-                    ctx.move_to(0, y).text(name)
+                ctx.move_to(-56, y).text(("> " if sel else "   ") + peer["name"])
+                _draw_signal_bars(ctx, 42, y, _signal_level(peer.get("rssi")))
+            ctx.text_align = ctx.CENTER
             ctx.font_size = 11
-            ctx.rgb(0.6, 0.6, 0.6).move_to(0, 96).text("C: invite  CANCEL: back")
-
-    def _draw_waiting(self, ctx, verb, name):
-        ctx.text_align = ctx.CENTER
-        ctx.text_baseline = ctx.MIDDLE
-        set_color(ctx, "label")
-        ctx.font_size = 18
-        ctx.move_to(0, -20).text(verb)
-        ctx.font_size = 20
-        ctx.rgb(0.9, 0.7, 0.1).move_to(0, 8).text(str(name))
-        # simple animated dots
-        dots = "." * (1 + int(self._to_t / 400) % 3)
-        ctx.font_size = 18
-        set_color(ctx, "label")
-        ctx.move_to(0, 36).text(dots)
-        ctx.font_size = 11
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 96).text("CANCEL: stop")
-
-    def _draw_invited(self, ctx):
-        ctx.text_align = ctx.CENTER
-        ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 20
-        ctx.rgb(0.9, 0.7, 0.1).move_to(0, -30).text(str(self.engaged_name))
-        set_color(ctx, "label")
-        ctx.font_size = 16
-        ctx.move_to(0, -4).text("wants to battle!")
-        ctx.font_size = 13
-        ctx.rgb(0.2, 0.8, 0.35).move_to(0, 40).text("C: accept")
-        ctx.rgb(0.9, 0.3, 0.3).move_to(0, 62).text("CANCEL: decline")
+            ctx.rgb(0.6, 0.6, 0.6).move_to(0, 98).text("C: challenge   F: back")
 
     def _draw_battle(self, ctx):
         pet = self.app.pet
@@ -1032,13 +767,6 @@ def _clamp01(v):
     return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
 
-def _confirm_or_cancel(event):
-    return (
-        BUTTON_TYPES["CONFIRM"] in event.button
-        or BUTTON_TYPES["CANCEL"] in event.button
-    )
-
-
 def _any_button(event):
     b = event.button
     return any(
@@ -1047,38 +775,23 @@ def _any_button(event):
     )
 
 
-def _clean_nonce(x):
-    try:
-        return int(x) & 0xFFFFFFFF
-    except (TypeError, ValueError):
-        return 0
+def _signal_level(rssi):
+    # coarse 1-3 signal level from RSSI (dBm); always >=1 if it's in the list
+    if rssi is None:
+        return 1
+    if rssi >= -55:
+        return 3
+    if rssi >= -72:
+        return 2
+    return 1
 
 
-def _is_battle_msg(event):
-    try:
-        return event.msg[:len(MAGIC)] == MAGIC
-    except Exception:
-        return False
-
-
-def _wifi_channel():
-    if not _HAVE_ESPNOW:
-        return None
-    try:
-        return espnow_service.wifi_channel
-    except Exception:
-        return None
-
-
-def _own_mac():
-    """This badge's real STA MAC (6 bytes), or None if it can't be read (the
-    caller then disables networked play - a random MAC wouldn't match what the
-    peer sees and would break winner agreement)."""
-    try:
-        import network
-        mac = network.WLAN(network.STA_IF).config("mac")
-        if isinstance(mac, (bytes, bytearray)) and len(mac) == 6:
-            return bytes(mac)
-    except Exception:
-        pass
-    return None
+def _draw_signal_bars(ctx, x, y, level):
+    # three rising bars, filled up to `level` (like a phone signal icon)
+    for i in range(3):
+        h = 3 + i * 3
+        if i < level:
+            ctx.rgb(0.2, 0.8, 0.35)
+        else:
+            ctx.rgb(0.32, 0.32, 0.32)
+        ctx.rectangle(x + i * 5, y + 4 - h, 3, h).fill()
