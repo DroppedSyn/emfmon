@@ -47,7 +47,15 @@ try:
 except Exception:  # pragma: no cover - always present on-badge
     random = None
 
-from .arcmenu import ArcMenu, draw_hints, pulse_k, ticks_diff, ticks_ms
+from .arcmenu import (
+    ArcMenu,
+    arc_text_layout,
+    draw_arc_text,
+    draw_hints,
+    pulse_k,
+    ticks_diff,
+    ticks_ms,
+)
 
 try:
     from .ble_link import BleLink
@@ -301,6 +309,7 @@ class Battle:
         self._rec_head = ("0W", "0L")
         self._rec_foot = None
         self._rec_rows_dirty = True
+        self._title_layout = None  # curved title, measured on first draw
         self.peer_idx = 0
         self._search_t = 0.0
         self._peer_refresh = 0.0   # throttle peer_list() (it allocates - fragments)
@@ -908,6 +917,13 @@ class Battle:
     _RING_RGB = (0.85, 0.12, 0.12)
     _RING_W = 3                       # stroke width, px
     _RING_R = 120 - _RING_W / 2 - 1   # centre it just inside the bezel
+    # Title curls around the TOP-RIGHT arc: the menu rows hug the left, so the
+    # right side is free. Radius is set in from the ring's inner edge so the
+    # glyphs sit inside it with a clear gap rather than touching it.
+    _TITLE_TEXT = "BATTLE MODE"
+    _TITLE_SIZE = 20
+    _TITLE_R = _RING_R - _RING_W / 2 - 18
+    _TITLE_MID = 52 * math.pi / 180   # clockwise from 12 o'clock
 
     def _draw_ring(self, ctx):
         """Red rim around the screen edge - frames battle mode. Drawn AFTER the
@@ -925,14 +941,16 @@ class Battle:
         self._draw_ring(ctx)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 20
+        if self._title_layout is None:
+            # measured once - the title never changes
+            self._title_layout = arc_text_layout(
+                ctx, self._TITLE_TEXT, self._TITLE_R,
+                self._TITLE_MID, self._TITLE_SIZE)
+        ctx.font_size = self._TITLE_SIZE
         k = pulse_k()                # same cadence as the selected menu row
         r, g, b = self._TITLE_RGB
         ctx.rgb(r * k, g * k, b * k)
-        # stacked and centred: two short lines fit the narrow top of the circle
-        # far better than one wide one, and clear the first menu row at y=-56
-        ctx.move_to(0, -104).text("Battle")
-        ctx.move_to(0, -80).text("Mode")
+        draw_arc_text(ctx, self._title_layout)
         m.draw_hint(ctx)             # last: the call-outs sit over the rim
 
     def _draw_info(self, ctx):

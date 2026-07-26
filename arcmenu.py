@@ -119,6 +119,46 @@ def draw_hints(ctx, c=None, f=None, rgb=HINT_RGB, size=HINT_SIZE, joy=True):
         ctx.move_to(HINT_C_XY[0], HINT_C_XY[1]).text(c)
 
 
+def arc_text_layout(ctx, text, radius, centre_rad, size):
+    """Lay `text` along a circle so it curls with the bezel.
+
+    `centre_rad` is measured from 12 o'clock, positive clockwise, and the string
+    is centred on it. Returns a list of (char, x, y, rotation) - each glyph's
+    point on the circle plus the angle that makes it tangent to it.
+
+    This MEASURES every glyph, so call it once and keep the result. Titles don't
+    change, and doing this per frame would be exactly the per-frame measurement
+    we took out of the menu rows.
+    """
+    ctx.font_size = size
+    try:
+        widths = [ctx.text_width(ch) for ch in text]
+    except Exception:                       # ctx can't measure - even spacing
+        widths = [size * 0.6] * len(text)
+    total = 0.0
+    for w in widths:
+        total += w
+    a = centre_rad - (total / radius) * 0.5   # arc length / radius = radians
+    out = []
+    for i in range(len(text)):
+        w = widths[i]
+        th = a + (w * 0.5) / radius           # glyph sits at its own midpoint
+        out.append((text[i], radius * math.sin(th), -radius * math.cos(th), th))
+        a += w / radius
+    return out
+
+
+def draw_arc_text(ctx, layout):
+    """Draw a layout from arc_text_layout. Assumes CENTER/MIDDLE alignment, so
+    each glyph lands centred on its point and rotated tangent to the circle."""
+    for ch, x, y, rot in layout:
+        ctx.save()
+        ctx.translate(x, y)
+        ctx.rotate(rot)
+        ctx.move_to(0, 0).text(ch)
+        ctx.restore()
+
+
 def pulse_k(period_ms=1600, lo=0.68):
     """Brightness multiplier in [lo, 1.0] that breathes on the wall clock.
 
