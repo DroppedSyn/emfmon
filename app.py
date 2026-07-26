@@ -826,7 +826,9 @@ class EMFMon(app.App):
         self._anim_t = 0.0
         self._dirty = True        # written by the next autosave (<=3s)
 
-    _MAIN_MENU = ("Items", "Rename", "History", "Battle", "New pet")
+    # Order matters: the destructive one is last, and the two most-used are
+    # first, so a mis-scroll lands on something harmless.
+    _MAIN_MENU = ("Items", "Battle", "History", "Rename", "New pet")
 
     def _open_arc(self, items, on_select, on_back=None, idx=0,
                   hint_c="C pick", hint_f="F back", side="right"):
@@ -857,10 +859,34 @@ class EMFMon(app.App):
             elif value == "Battle":
                 self._open_battle()
             elif value == "New pet":
-                self._hatch_new()
+                self._confirm_new_pet()
 
         # opened by the LEFT button, so it flies out from the left edge
         self._open_arc(list(self._MAIN_MENU), on_select, side="left")
+
+    def _confirm_new_pet(self):
+        """New pet REPLACES a living mon - it is archived to history and a
+        stranger hatches in its place. That is the only irreversible thing in
+        the app, so it does not happen on a single press."""
+        if not self.pet.get("alive", True):
+            self._hatch_new()      # nothing to lose - the mon is already gone
+            return
+        name = str(self.pet.get("name", "your mon"))
+
+        def on_select(idx):
+            if idx == 1:
+                self._hatch_new()
+            else:
+                self._open_menu()  # "Cancel" goes back where they came from
+
+        self._open_arc(
+            ["Cancel", "Replace " + name],
+            on_select,
+            on_back=lambda idx: self._open_menu(),
+            idx=0,                 # default to the safe option, never the ruin
+            side="left",           # (default "C pick" call-out: "C confirm"
+            #                        is 9 chars and overruns the bezel there)
+        )
 
     def _open_battle(self):
         # Battle is an OPTIONAL addon - if it fails to import or construct, the
