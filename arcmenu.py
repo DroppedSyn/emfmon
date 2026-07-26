@@ -48,17 +48,17 @@ except ImportError:                     # CPython (desktop tests)
 # the circle narrows fast at the extremes: at y=+-84 only about +-83px of width
 # is left. Hence these anchors - far enough out to miss the rows, far enough in
 # to miss the bezel.
-HINT_F_XY = (-52, -82)      # upper-left, by F
-HINT_C_XY = (52, 82)        # lower-right, by C
+HINT_F_XY = (-47, -74)      # upper-left, by F
+HINT_C_XY = (47, 74)        # lower-right, by C
 HINT_RGB = (1.0, 0.83, 0.15)
-HINT_SIZE = 15
-# Keep call-out labels to ~7 characters: at these anchors the circle
-# leaves about +-85px of width, and a longer one ("C challenge") runs
-# off the bezel however you place it.
-HINT_MAX_CHARS = 7
+HINT_SIZE = 12
+# Pulled in from the bezel and sized down: out at the rim these read as clutter
+# competing with the menu itself, rather than as a quiet guide. They still have
+# to clear the menu's rows (|y| <= 56) and stay inside the edge.
+HINT_MAX_CHARS = 10
 
 
-JOY_XY = (0, 100)           # bottom centre, clear of both call-outs
+JOY_XY = (0, 92)            # bottom centre, in line with the call-outs above
 JOY_R = 5                   # ring radius
 JOY_GAP = 2                 # ring -> arrow base
 JOY_ARROW = 4               # arrow length
@@ -176,7 +176,7 @@ class ArcMenu:
     def __init__(self, items=None, idx=0, hint_c="C pick", hint_f="F back",
                  side="right", radius=118.0, row=28, span=2, scrim=0.55,
                  font=15, font_sel=31, font_hint=HINT_SIZE, debounce=160,
-                 sel_rgb=(0.35, 0.75, 1.0), row_rgb=(0.62, 0.62, 0.62),
+                 sel_rgb=(0.35, 0.75, 1.0), row_rgb=(0.80, 0.80, 0.82),
                  hint_rgb=HINT_RGB,
                  pulse=True, pulse_ms=1600, font_min=10):
         """items  list of label strings (already formatted - counts, ticks, ...)
