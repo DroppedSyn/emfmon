@@ -22,7 +22,13 @@ import app
 from app_components import TextDialog, clear_background
 from app_components.tokens import set_color
 
-from .arcmenu import ArcMenu, ticks_diff, ticks_ms
+from .arcmenu import (
+    ArcMenu,
+    arc_text_layout,
+    draw_arc_text,
+    ticks_diff,
+    ticks_ms,
+)
 from events.input import BUTTON_TYPES, ButtonDownEvent
 from events.joystick import JOYSTICK_BUTTON_TYPES
 from system.eventbus import eventbus
@@ -260,6 +266,20 @@ def _new_pet():
         "grow_ms": 0.0,    # on-time accumulated toward full size (GROW_MS)
         # Tick accumulators are PERSISTED so age/health/death/heal count on-time
         # across restarts, the same way grow_ms and the needs already do.
+        #
+        # DELIBERATELY no wall-clock catch-up, and please don't add one. The pet
+        # advances on ACCUMULATED ON-TIME only: switch the badge off and it is
+        # paused, not ageing. Two reasons:
+        #   1. There is no clock to do it with. The RTC is never NTP-synced
+        #      outside an OTA check, so time.localtime() reads 2000-01-01 (this
+        #      is also why battle records stamp the mon's age, not a date).
+        #   2. It would be a mass extinction. Replaying elapsed time means
+        #      replaying the decay: an adult is at death-risk after ~2.5h of
+        #      neglect and likely dead by ~5h, so any overnight charge would
+        #      wipe out every mon that isn't an elder.
+        # Deltas come from ticks_diff(), which measures ELAPSED ms, and the
+        # accumulators drain with `while`, so a starved loop catches up exactly
+        # - the model loses no time while the badge is actually running.
         "hour_acc": 0.0,   # -> age tick
         "health_acc": 0.0,  # -> health tick
         "death_acc": 0.0,  # -> death roll
@@ -379,6 +399,14 @@ class EMFMon(app.App):
         self._lock_t0 = ticks_ms()
         self._lock_ms = 0
         self.inv_idx = 0           # remembered wheel position between opens
+        # cached name string and curved trait/stage layouts (see _draw_bars)
+        self._name_text = None
+        self._nl_name = None
+        self._nl_age = None
+        self._trait_layout = None
+        self._stage_layout = None
+        self._nl_trait = None
+        self._nl_stage = None
         self._anim_type = None     # current action animation type, or None
         self._anim_t = 0.0         # ms elapsed in the current animation
         # (the age/health/heal/death accumulators now live in the pet dict so
@@ -1280,6 +1308,19 @@ class EMFMon(app.App):
 
     _BAR_ROWS = (("HP", "health"), ("Food", "food"),
                  ("Fun", "fun"), ("Clean", "clean"))
+    _NAME_RGB = (0.35, 0.75, 1.0)   # same shining blue as a selected menu row
+    # Trait + life stage ride the upper-right rim as two stacked arcs, in the
+    # same yellow as the button call-outs, and deliberately SMALLER than the
+    # name so it reads as secondary. Centred between the "Food" label at
+    # 0 deg and "Clean" at ~76 deg, and span-capped so a long trait ("Playful")
+    # cannot grow into Clean - it shrinks to fit instead.
+    _ARC_MID = 38.0 * math.pi / 180
+    _ARC_MAX_SPAN = 52.0 * math.pi / 180
+    _TRAIT_R = 100.0
+    _TRAIT_SIZE = 10
+    _STAGE_R = 85.0
+    _STAGE_SIZE = 9
+    _ARC_RGB = (1.0, 0.83, 0.15)
 
     def _draw_bars(self, ctx):
         ctx.text_align = ctx.LEFT
@@ -1306,18 +1347,42 @@ class EMFMon(app.App):
                 ctx.rgb(0.2, 0.8, 0.35)
             ctx.rectangle(x0, y, bw * max(0.0, min(1.0, val / 100.0)), bh).fill()
 
-        # name + age
-        set_color(ctx, "label")
+        # Name + age, back where it reads best: straight, centred, above the
+        # bars. CACHED - this runs every frame and the old f-string built a
+        # fresh string each time. The key is compared field by field rather
+        # than by joining, so the common case allocates nothing at all.
+        name = self.pet["name"]
+        age = self.pet["age"]
+        if self._name_text is None or name != self._nl_name or age != self._nl_age:
+            self._name_text = "%s  %dh" % (name, age)
+            self._nl_name = name
+            self._nl_age = age
         ctx.text_align = ctx.CENTER
+        ctx.text_baseline = ctx.MIDDLE
         ctx.font_size = 12
-        ctx.move_to(0, -88).text(f"{self.pet['name']}   {self.pet['age']}h")
-        # personality + life stage, a small subtitle under the name
-        stage = _life_stage(self.pet["age"])
-        sub = (TRAIT_LABEL.get(self.pet.get("trait"), "") + "  " + STAGE_LABEL.get(stage, "")).strip()
-        if sub:
-            ctx.font_size = 9
-            ctx.rgb(0.55, 0.55, 0.6)
-            ctx.move_to(0, -76).text(sub)
+        ctx.rgb(*self._NAME_RGB)
+        ctx.move_to(0, -88).text(self._name_text)
+
+        # Trait and life stage curl around the upper-right rim, stacked on two
+        # radii, in the call-out yellow - the old grey subtitle was hard to read
+        # and it was crowding the name. Also cached: only the stage ever changes.
+        stage = _life_stage(age)
+        trait = self.pet.get("trait")
+        if (self._trait_layout is None or trait != self._nl_trait
+                or stage != self._nl_stage):
+            self._trait_layout = arc_text_layout(
+                ctx, TRAIT_LABEL.get(trait, ""), self._TRAIT_R, self._ARC_MID,
+                self._TRAIT_SIZE, max_span=self._ARC_MAX_SPAN)
+            self._stage_layout = arc_text_layout(
+                ctx, STAGE_LABEL.get(stage, ""), self._STAGE_R, self._ARC_MID,
+                self._STAGE_SIZE, max_span=self._ARC_MAX_SPAN)
+            self._nl_trait = trait
+            self._nl_stage = stage
+        ctx.rgb(*self._ARC_RGB)
+        ctx.font_size = self._TRAIT_SIZE
+        draw_arc_text(ctx, self._trait_layout)
+        ctx.font_size = self._STAGE_SIZE
+        draw_arc_text(ctx, self._stage_layout)
 
 
 __app_export__ = EMFMon

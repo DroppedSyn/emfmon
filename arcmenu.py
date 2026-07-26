@@ -119,12 +119,18 @@ def draw_hints(ctx, c=None, f=None, rgb=HINT_RGB, size=HINT_SIZE, joy=True):
         ctx.move_to(HINT_C_XY[0], HINT_C_XY[1]).text(c)
 
 
-def arc_text_layout(ctx, text, radius, centre_rad, size):
+def arc_text_layout(ctx, text, radius, centre_rad, size, max_span=None,
+                    min_size=8):
     """Lay `text` along a circle so it curls with the bezel.
 
     `centre_rad` is measured from 12 o'clock, positive clockwise, and the string
     is centred on it. Returns a list of (char, x, y, rotation) - each glyph's
     point on the circle plus the angle that makes it tangent to it.
+
+    `max_span` (radians) caps how much of the circle the string may occupy: if
+    it would run wider, the point size is scaled down to fit, never below
+    `min_size`. Needed wherever a variable string shares the rim with fixed
+    labels - a long name must not grow into them.
 
     This MEASURES every glyph, so call it once and keep the result. Titles don't
     change, and doing this per frame would be exactly the per-frame measurement
@@ -138,6 +144,16 @@ def arc_text_layout(ctx, text, radius, centre_rad, size):
     total = 0.0
     for w in widths:
         total += w
+    if max_span and total / radius > max_span:
+        size = max(min_size, int(size * max_span * radius / total))
+        ctx.font_size = size
+        try:
+            widths = [ctx.text_width(ch) for ch in text]
+        except Exception:
+            widths = [size * 0.6] * len(text)
+        total = 0.0
+        for w in widths:
+            total += w
     a = centre_rad - (total / radius) * 0.5   # arc length / radius = radians
     out = []
     for i in range(len(text)):
