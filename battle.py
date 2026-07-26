@@ -17,7 +17,7 @@ CRITICAL: the ButtonDownEvent handler is registered under the EMFMon app on the
 eventbus, and the bus KILLS the owning app if a handler raises. So _handle_input
 must never propagate an exception.
 
-DISCOVERY (this stage): 'Find opponent' advertises EMFMon:<name> and scans,
+DISCOVERY (this stage): 'PVP' advertises EMFMon:<name> and scans,
 listing nearby searching badges closest-first. The GATT invite/accept/stats
 handshake is the next stage - challenging a peer currently shows a note.
 """
@@ -89,6 +89,39 @@ _LOSER_HITS = (_SHOTS + 1) // 2      # winner fires on even shots -> hits the lo
 _WINNER_HITS = _SHOTS // 2           # loser fires on odd shots -> hits the winner
 _WINNER_END_BAR = 45.0               # winner's health bar left at the end
 _HIT_FLASH_MS = 200                  # a bar flashes white this long after a hit
+
+# --- battle screen ---------------------------------------------------------
+# Health bars are ARCS hugging the bezel: ours in the bottom-left corner
+# (nearest the holder), theirs in the top-right, diagonally opposite - the same
+# diagonal the mons and the projectile already use. Angles run from +x with y
+# down, so they increase clockwise: 90 deg = bottom, 180 = left, 270 = top.
+_BAR_R = 104.0                    # arc radius
+_BAR_T = 9                        # stroke thickness
+_MY_ARC = (100.0 * math.pi / 180, 172.0 * math.pi / 180)    # bottom-left
+_OPP_ARC = (280.0 * math.pi / 180, 352.0 * math.pi / 180)   # top-right
+_BAR_H = 9
+_BAR_TRACK = (0.16, 0.16, 0.18)
+_BAR_GHOST = (0.55, 0.12, 0.12)   # damage just taken, draining away behind
+_BAR_HI = (0.25, 0.80, 0.35)      # health colour bands - the bar says how bad
+_BAR_MID = (0.95, 0.70, 0.15)     # it is without anyone reading a number
+_BAR_LO = (0.90, 0.25, 0.20)
+_GHOST_MS = 320.0                 # ms for the ghost to catch up to a hit
+# Each combatant is a column: mon, then name, then bar - all on one x, so a
+# glance ties the three together. Mine bottom-left, theirs top-right.
+_MY_XY = (-46, 34)
+_OPP_XY = (46, -34)
+_MY_NAME_Y = 62
+_MY_BAR_Y = 78
+_OPP_NAME_Y = -62
+_OPP_BAR_Y = -78
+
+
+def _bar_colour(v):
+    if v > 55.0:
+        return _BAR_HI
+    if v > 25.0:
+        return _BAR_MID
+    return _BAR_LO
 
 
 def _xorshift(seed):
@@ -249,7 +282,7 @@ class Battle:
         self.archived = records is not None
         self.records = records if self.archived else _load_records()
         self.rec_title = title     # past mon's name, shown instead of "Ranked"
-        self.menu_items = ("Practice", "Find opponent", "Records", "Back")
+        self.menu_items = ("Practice", "PVP", "Records", "Back")
         self.menu_idx = 0
         self.rec_items = ("Ranked", "Practice", "Back")
         self.rec_idx = 0
@@ -287,6 +320,11 @@ class Battle:
         self.anim_t = 0.0
         self.my_bar = 100.0
         self.opp_bar = 100.0
+        # Ghost bars lag behind the real ones, so a hit leaves a red sliver that
+        # drains away - you can see how much that shot cost you.
+        self._ghost_my = 100.0
+        self._ghost_opp = 100.0
+        self._combat_rgb = None    # (myR,myG,myB, oppR,oppG,oppB), built once
         self._hits_done = 0        # shots whose damage we've already applied
         self._flash_my = 0.0       # ms of hit-flash left on each bar
         self._flash_opp = 0.0
@@ -395,6 +433,9 @@ class Battle:
         self.anim_t = 0.0
         self.my_bar = 100.0
         self.opp_bar = 100.0
+        self._ghost_my = 100.0
+        self._ghost_opp = 100.0
+        self._combat_rgb = None    # new opponent, new colours
         self._hits_done = 0
         self._flash_my = 0.0
         self._flash_opp = 0.0
@@ -558,6 +599,19 @@ class Battle:
         self.anim_t += delta
         self._flash_my = max(0.0, self._flash_my - delta)
         self._flash_opp = max(0.0, self._flash_opp - delta)
+        # ease the ghosts down toward the real bars (no allocation, no state
+        # beyond these two floats)
+        e = delta / _GHOST_MS
+        if e > 1.0:
+            e = 1.0
+        if self._ghost_my > self.my_bar:
+            self._ghost_my += (self.my_bar - self._ghost_my) * e
+        else:
+            self._ghost_my = self.my_bar
+        if self._ghost_opp > self.opp_bar:
+            self._ghost_opp += (self.opp_bar - self._ghost_opp) * e
+        else:
+            self._ghost_opp = self.opp_bar
         # Health drops in a STEP each time a projectile lands (not a smooth
         # drain). A shot fired at t=k*_SHOT_MS lands at (k+1)*_SHOT_MS; even
         # shots hit the loser, odd shots hit the winner.
@@ -639,8 +693,10 @@ class Battle:
         # snap bars/flash to their final state and apply the result exactly once
         if self.i_won:
             self.my_bar, self.opp_bar = _WINNER_END_BAR, 0.0
+            self._ghost_my, self._ghost_opp = _WINNER_END_BAR, 0.0
         else:
             self.my_bar, self.opp_bar = 0.0, _WINNER_END_BAR
+            self._ghost_my, self._ghost_opp = 0.0, _WINNER_END_BAR
         self._flash_my = 0.0
         self._flash_opp = 0.0
         self._apply_result()
@@ -698,7 +754,7 @@ class Battle:
     def _menu_select(self, item):
         if item == "Practice":
             self._start_practice()
-        elif item == "Find opponent":
+        elif item == "PVP":
             if self.ble is None:
                 self.message = "Bluetooth not\navailable here."
                 self.state = "info"
@@ -1076,7 +1132,7 @@ class Battle:
         ctx.text_baseline = ctx.MIDDLE
         set_color(ctx, "label")
         ctx.font_size = 17
-        ctx.move_to(0, -96).text("Find opponent")
+        ctx.move_to(0, -96).text("PVP")
         ctx.font_size = 11
         ctx.rgb(0.35, 0.55, 0.95).move_to(0, -78).text("via Bluetooth")
         peers = self._peers
@@ -1088,7 +1144,7 @@ class Battle:
                 ctx.font_size = 12
                 ctx.rgb(0.9, 0.7, 0.1)
                 for i, line in enumerate(
-                    ("No badges nearby.", "They must also be", "in 'Find opponent'.")
+                    ("No badges nearby.", "They must also be", "in PVP too.")
                 ):
                     ctx.move_to(0, 6 + i * 18).text(line)
             draw_hints(ctx, f="F back")
@@ -1131,11 +1187,22 @@ class Battle:
         ctx.font_size = 12
         ctx.rgb(0.6, 0.6, 0.6).move_to(0, 96).text("F: cancel")
 
+    def _combat_colours(self):
+        """(myR,myG,myB, oppR,oppG,oppB), built once per battle. Opponent colour
+        arrives over the air, so it is coerced defensively - and caching keeps
+        that off the per-frame path."""
+        if self._combat_rgb is None:
+            self._combat_rgb = (
+                _rgb3(self.app.pet.get("colour"))
+                + _rgb3((self.opp or {}).get("colour")))
+        return self._combat_rgb
+
     def _draw_battle(self, ctx):
         pet = self.app.pet
         opp = self.opp or {}
-        mx, my = -46, 34
-        ox, oy = 46, -34
+        mx, my = _MY_XY
+        ox, oy = _OPP_XY
+        mr, mg, mb, orr, og, ob = self._combat_colours()
         intro = _clamp01(self.anim_t / _INTRO_MS)
         my_dead = self.state == "result" and not self.i_won
         opp_dead = self.state == "result" and self.i_won
@@ -1147,14 +1214,18 @@ class Battle:
                   opp.get("colour", [0.6, 0.6, 0.6]), fainted=opp_dead)
         if self.state == "anim" and _INTRO_MS < self.anim_t < _INTRO_MS + _VOLLEY_MS:
             self._draw_projectile(ctx, mx, my, ox, oy)
-        self._draw_bar(ctx, -70, 70, self.my_bar, (0.3, 0.6, 1.0), self._flash_my)
-        self._draw_bar(ctx, 14, -78, self.opp_bar, (1.0, 0.5, 0.3), self._flash_opp)
+        self._draw_bar(ctx, _MY_ARC, self.my_bar, self._ghost_my,
+                       self._flash_my, mr, mg, mb)
+        self._draw_bar(ctx, _OPP_ARC, self.opp_bar, self._ghost_opp,
+                       self._flash_opp, orr, og, ob)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
-        ctx.font_size = 12
-        set_color(ctx, "label")
-        ctx.move_to(mx, my + 34).text(str(pet.get("name", "you")))
-        ctx.move_to(ox, oy - 34).text(str(opp.get("name", "???")))
+        ctx.font_size = 14
+        # names in their own mon's colour - identity, not just a label
+        ctx.rgb(mr, mg, mb).move_to(mx, _MY_NAME_Y).text(
+            pet.get("name", "you"))
+        ctx.rgb(orr, og, ob).move_to(ox, _OPP_NAME_Y).text(
+            opp.get("name", "???"))
         if self.state == "result":
             self._draw_result_banner(ctx)
 
@@ -1171,14 +1242,47 @@ class Battle:
         py = sy + (ty - sy) * frac
         ctx.rgb(*col).arc(px, py, 5, 0, 2 * math.pi, False).fill()
 
-    def _draw_bar(self, ctx, x, y, val, col, flash=0.0):
-        ctx.rgb(0.25, 0.25, 0.25).rectangle(x, y, 56, 7).fill()
-        if flash > 0.0:
-            f = min(1.0, flash / _HIT_FLASH_MS)  # brighten toward white on a hit
-            col = (col[0] + (1.0 - col[0]) * f,
-                   col[1] + (1.0 - col[1]) * f,
-                   col[2] + (1.0 - col[2]) * f)
-        ctx.rgb(*col).rectangle(x, y, 56 * _clamp01(val / 100.0), 7).fill()
+    def _draw_bar(self, ctx, arc, val, ghost, flash, r, g, b):
+        """A curved health bar: frame, track, ghost, fill - back to front.
+
+        Each layer is one thick arc stroke rather than a rectangle, so the bar
+        follows the bezel. It always drains toward its own corner, away from the
+        middle of the screen.
+
+        The frame takes the mon's OWN colour, tying bar to creature; the fill is
+        graded by remaining health, so it reads at a glance without printing a
+        number - which would mean building a string every frame.
+        """
+        a0, a1 = arc
+        span = a1 - a0
+        ctx.line_width = _BAR_T + 3          # frame, peeking out behind
+        ctx.rgb(r * 0.85, g * 0.85, b * 0.85)
+        ctx.begin_path()
+        ctx.arc(0, 0, _BAR_R, a0, a1, False)
+        ctx.stroke()
+        ctx.line_width = _BAR_T
+        ctx.rgb(*_BAR_TRACK)
+        ctx.begin_path()
+        ctx.arc(0, 0, _BAR_R, a0, a1, False)
+        ctx.stroke()
+        if ghost > val:
+            ctx.rgb(*_BAR_GHOST)
+            ctx.begin_path()
+            ctx.arc(0, 0, _BAR_R, a0, a0 + span * _clamp01(ghost / 100.0), False)
+            ctx.stroke()
+        if val > 0.0:
+            fr, fg, fb = _bar_colour(val)
+            if flash > 0.0:                  # brighten toward white on a hit
+                f = flash / _HIT_FLASH_MS
+                if f > 1.0:
+                    f = 1.0
+                fr += (1.0 - fr) * f
+                fg += (1.0 - fg) * f
+                fb += (1.0 - fb) * f
+            ctx.rgb(fr, fg, fb)
+            ctx.begin_path()
+            ctx.arc(0, 0, _BAR_R, a0, a0 + span * _clamp01(val / 100.0), False)
+            ctx.stroke()
 
     def _draw_result_banner(self, ctx):
         ctx.text_align = ctx.CENTER
@@ -1201,6 +1305,16 @@ class Battle:
 # --- module helpers --------------------------------------------------------
 def _clamp01(v):
     return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+
+
+def _rgb3(colour):
+    """Coerce a stored/received colour to three floats. The opponent's arrives
+    over the air, so it can be anything at all."""
+    try:
+        r, g, b = colour
+        return float(r), float(g), float(b)
+    except Exception:
+        return 0.6, 0.6, 0.6
 
 
 
