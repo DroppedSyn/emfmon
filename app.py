@@ -19,8 +19,10 @@ import math
 import random
 
 import app
-from app_components import Menu, TextDialog, clear_background
+from app_components import TextDialog, clear_background
 from app_components.tokens import set_color
+
+from .arcmenu import ArcMenu, ticks_diff, ticks_ms
 from events.input import BUTTON_TYPES, ButtonDownEvent
 from events.joystick import JOYSTICK_BUTTON_TYPES
 from system.eventbus import eventbus
@@ -77,8 +79,40 @@ DECAY_MIN_MULT = 0.1
 RED_AT = 25.0        # a need below this shows red AND hurts health (25%)
 NOTIFY_AT = 30.0     # show the "mon!" alert below this (>= RED_AT, an early warning)
 ACTION_GAIN = {"food": 35.0, "fun": 35.0, "clean": 40.0, "injection": 30.0}
-HEAL_GAIN_MS = 1800_000  # you gain one heal item every 30 minutes (start with 0)
-MAX_HEALS = 9            # cap on stored heal items (keeps the count tidy)
+# --- inventory -------------------------------------------------------------
+# Consumables the mon carries. Items are restoratives and buffs ONLY: Play and
+# Clean are free actions and are never items. Adding a new one is a single entry
+# here plus, if it does something other than restore health, a branch in
+# _use_item(); the inventory screen, HUD, save migration, validation and the
+# grant loop are all driven off this table.
+#   label    shown on the Inventory screen
+#   short    shown on the pet HUD (space is tight - keep it to ~7 chars)
+#   heal     HP restored on use; None for an item that isn't a restorative
+#   cap      most the mon can carry
+#   gain_ms  granted per this much on-time; None = never granted automatically,
+#            it has to come from somewhere else (battle reward, trade, ...) by
+#            doing inv[id] = inv.get(id, 0) + 1
+#   gain_n   how many are granted each time (optional, defaults to 1)
+ITEMS = {
+    # The heal ladder. Only Small Heal is granted by time - the bigger ones need
+    # a source (battle reward, trade) once one exists.
+    "small": {
+        "label": "Small Heal", "short": "S.Heal",
+        "heal": 15.0, "cap": 30, "gain_ms": 1800_000, "gain_n": 2,
+    },
+    "heal": {
+        "label": "Heal", "short": "Heal",
+        "heal": 30.0, "cap": 30, "gain_ms": None,
+    },
+    "medium": {
+        "label": "Medium Heal", "short": "M.Heal",
+        "heal": 50.0, "cap": 20, "gain_ms": None,
+    },
+    "greater": {
+        "label": "Greater Heal", "short": "G.Heal",
+        "heal": 100.0, "cap": 5, "gain_ms": None,
+    },
+}
 HEALTH_DROP = 10.0   # health lost each health tick when any need is below RED_AT
 # Younger pets are more fragile: extra health damage that fades to nothing as the
 # pet matures. At age 0 the drop is HEALTH_DROP * (1 + HEALTH_AGE_BONUS); by
@@ -228,9 +262,9 @@ def _new_pet():
         # across restarts, the same way grow_ms and the needs already do.
         "hour_acc": 0.0,   # -> age tick
         "health_acc": 0.0,  # -> health tick
-        "heal_acc": 0.0,   # -> heal-item gain
         "death_acc": 0.0,  # -> death roll
-        "heals": 0,        # heal items in inventory (gain 1 per HEAL_GAIN_MS)
+        "inv": {},         # item id -> count carried (see ITEMS)
+        "acc": {},         # item id -> on-time accumulated toward the next grant
         "health": 100.0,
         "food": 100.0,
         "fun": 100.0,
@@ -287,45 +321,47 @@ def _get_alert_icon():
 _active_mon = None
 
 
-def _log_reset_cause():
-    # TEMP DIAGNOSTIC: record why the badge last reset, so a crash on the BLE
-    # search screen tells us watchdog vs panic vs brownout (see resetlog.txt).
-    try:
-        import machine
-        rc = machine.reset_cause()
-        names = {
-            getattr(machine, "PWRON_RESET", -1): "PWRON",
-            getattr(machine, "HARD_RESET", -2): "HARD/panic?",
-            getattr(machine, "WDT_RESET", -3): "WDT",
-            getattr(machine, "DEEPSLEEP_RESET", -4): "DEEPSLEEP",
-            getattr(machine, "SOFT_RESET", -5): "SOFT",
-            getattr(machine, "BROWNOUT_RESET", -6): "BROWNOUT",
-        }
-        with open("/apps/emfmon/resetlog.txt", "a") as f:
-            f.write("cause=%d (%s)\n" % (rc, names.get(rc, "?")))
-    except Exception as e:
-        print("resetlog:", e)
-
-
 class EMFMon(app.App):
     def __init__(self):
         super().__init__()
-        _log_reset_cause()  # TEMP: diagnose the BLE search-screen reboot
         # Claim the active slot so any older instance left running in the
         # background (see _active_mon) stops simulating and saving.
         global _active_mon
         _active_mon = self
         self.pet = self._load_state() or _new_pet()
         self.history = self._load_history()
-        self.view = "pet"          # "pet" | "menu" | "battle"
-        self.menu = None
+        self.view = "pet"          # "pet" | "battle"
         self.dialog = None
         self.battle = None         # optional battle addon controller (battle.py)
+        # Curved overlay menu (arcmenu.ArcMenu) or None. It draws ON the pet
+        # view rather than replacing it, so the mon stays visible behind it.
+        # ONE menu object for the app's lifetime, reconfigured per use via
+        # set_items(). battle.py borrows this same instance, so every menu in
+        # EMFMon shares one allocation and one set of styling.
+        self.arcmenu = ArcMenu()
+        self.arc = None            # -> self.arcmenu while an overlay is showing
+        self._arc_select = None    # handlers for the open overlay (see _open_arc)
+        self._arc_back = None
+        # The press currently being dispatched from an overlay. Anything opened
+        # from a menu handler that subscribes to the eventbus is handed this
+        # same event afterwards and must ignore it (Battle._opened_by). Set here
+        # so a future caller that opens Battle from OUTSIDE the menu path gets
+        # None rather than an AttributeError.
+        self._arc_event = None
+        # Wall-clock lockout for the PET screen, armed when an overlay closes.
+        # Without it a double-fired scroll (or a late-delivered press) lands on
+        # the pet the instant the wheel shuts and fires an action: UP is Food,
+        # RIGHT is Clean, so using an item appeared to play a random animation
+        # as the pet action overwrote the injection one.
+        self._lock_t0 = ticks_ms()
+        self._lock_ms = 0
+        self.inv_idx = 0           # remembered wheel position between opens
         self._anim_type = None     # current action animation type, or None
         self._anim_t = 0.0         # ms elapsed in the current animation
         # (the age/health/heal/death accumulators now live in the pet dict so
         # they persist across restarts - see _new_pet)
         self._save_acc = 0.0       # ms accumulated toward the next autosave
+        self._dirty = False        # a user action is waiting to be written
         # Shared always-on-top "mon!" indicator on the home screen (started once
         # for the whole session; see _get_alert_icon).
         self.icon = _get_alert_icon()
@@ -360,17 +396,17 @@ class EMFMon(app.App):
             # coerce numeric fields - a wrong-typed value from a corrupt or
             # hand-edited save would otherwise crash the background simulation
             d = _new_pet()  # pristine defaults (its numeric fields are fixed)
-            for k in ("age", "heals", "strength"):
+            for k in ("age", "strength"):
                 try:
                     base[k] = max(0, int(base[k]))  # never negative
                 except (TypeError, ValueError):
                     base[k] = d[k]
             # a negative age would make the health-tick interval <= 0 and hang
             # the badge in an infinite while-loop; max(0, ...) above prevents it.
-            base["heals"] = min(MAX_HEALS, base["heals"])
             base["strength"] = min(STRENGTH_MAX, max(STRENGTH_MIN, base["strength"]))
+            self._migrate_inventory(base, pet)
             for k in (
-                "grow_ms", "hour_acc", "health_acc", "heal_acc", "death_acc",
+                "grow_ms", "hour_acc", "health_acc", "death_acc",
                 "fit_acc", "health", "food", "fun", "clean", "clean_mark",
             ):
                 try:
@@ -380,7 +416,7 @@ class EMFMon(app.App):
             # clamp to sane ranges so a corrupt/hand-edited save can't misbehave
             for k in ("health", "food", "fun", "clean", "clean_mark"):
                 base[k] = min(100.0, max(0.0, base[k]))
-            for k in ("grow_ms", "hour_acc", "health_acc", "heal_acc",
+            for k in ("grow_ms", "hour_acc", "health_acc",
                       "death_acc", "fit_acc"):
                 base[k] = max(0.0, base[k])
             base["grow_ms"] = min(GROW_MS, base["grow_ms"])
@@ -401,6 +437,57 @@ class EMFMon(app.App):
             return base
         except Exception:
             return None
+
+    def _migrate_inventory(self, base, raw):
+        """Normalise inv/item/acc, folding in pre-inventory saves.
+
+        Before the inventory a mon carried a bare `heals` int plus a `heal_acc`
+        accumulator; those become inv["heal"] and acc["heal"]. Ids that aren't in
+        ITEMS are dropped rather than carried forever, so retiring an item can't
+        leave junk in every save - and counts are clamped to each item's cap the
+        way `heals` used to be clamped to MAX_HEALS.
+        """
+        inv = base.get("inv")
+        if not isinstance(inv, dict):
+            inv = {}
+        clean = {}
+        for iid, spec in ITEMS.items():
+            try:
+                n = int(inv.get(iid, 0))
+            except (TypeError, ValueError):
+                n = 0
+            clean[iid] = min(spec["cap"], max(0, n))
+        if "inv" not in raw and "heals" in raw:
+            try:
+                clean["heal"] = min(
+                    ITEMS["heal"]["cap"], max(0, int(raw["heals"]))
+                )
+            except (TypeError, ValueError):
+                pass
+        base["inv"] = clean
+
+        acc = base.get("acc")
+        if not isinstance(acc, dict):
+            acc = {}
+        cacc = {}
+        for iid in ITEMS:
+            try:
+                cacc[iid] = max(0.0, float(acc.get(iid, 0.0)))
+            except (TypeError, ValueError):
+                cacc[iid] = 0.0
+        if "acc" not in raw and "heal_acc" in raw:
+            try:
+                cacc["heal"] = max(0.0, float(raw["heal_acc"]))
+            except (TypeError, ValueError):
+                pass
+        base["acc"] = cacc
+
+        # superseded fields - drop them so they stop being re-saved. "item" was
+        # a short-lived "active item" the wheel assigned; C now opens the wheel
+        # and you use what you select, so nothing is assigned any more.
+        base.pop("heals", None)
+        base.pop("heal_acc", None)
+        base.pop("item", None)
 
     def _save_state(self):
         if self is not _active_mon:
@@ -424,6 +511,28 @@ class EMFMon(app.App):
                 f.write(json.dumps(self.history))
         except Exception as e:
             print("EMFMon: history save failed:", e)
+
+    def _archive_battle_records(self):
+        """Snapshot the outgoing mon's battle record for its history entry and
+        clear the live one, so the successor starts from 0W-0L.
+
+        Returns None if the battle addon isn't importable - the history entry is
+        still written, it just has no record attached.
+        """
+        try:
+            from .battle import archive_records, blank_records
+        except Exception as e:
+            print("EMFMon: archive records failed:", e)
+            return None
+        rec = archive_records()
+        if self.battle is not None:
+            # a battle view open right now holds the old record in memory and
+            # would save it straight back over the file we just cleared
+            try:
+                self.battle.records = blank_records()
+            except Exception:
+                pass
+        return rec
 
     # --- simulation (runs in background AND foreground) --------------------
     def background_update(self, delta):
@@ -460,11 +569,25 @@ class EMFMon(app.App):
         # grow from a tiny dot to full size over GROW_MS of running time
         pet["grow_ms"] = min(GROW_MS, pet.get("grow_ms", 0.0) + delta)
 
-        # gain one heal item every HEAL_GAIN_MS (up to MAX_HEALS)
-        pet["heal_acc"] = pet.get("heal_acc", 0.0) + delta
-        while pet["heal_acc"] >= HEAL_GAIN_MS:
-            pet["heal_acc"] -= HEAL_GAIN_MS
-            pet["heals"] = min(MAX_HEALS, pet.get("heals", 0) + 1)
+        # grant items on their own schedules (ITEMS[id]["gain_ms"]). Items with
+        # gain_ms None are never granted here - they come from elsewhere.
+        inv = pet.setdefault("inv", {})
+        acc = pet.setdefault("acc", {})
+        for iid, spec in ITEMS.items():
+            every = spec["gain_ms"]
+            if not every:
+                continue
+            a = acc.get(iid, 0.0) + delta
+            cap = spec["cap"]
+            n = spec.get("gain_n", 1)
+            while a >= every:
+                a -= every
+                # at cap the timer still cycles, so a full pouch doesn't bank
+                # an instant refill the moment one is spent
+                cur = inv.get(iid, 0)
+                if cur < cap:
+                    inv[iid] = min(cap, cur + n)
+            acc[iid] = a
 
         # fitness: strength creeps up slowly while the pet is kept healthy
         # (only counts on-time spent at high health; never decreases)
@@ -505,9 +628,15 @@ class EMFMon(app.App):
                 self._die()
                 break
 
+        # Persist on a timer rather than on every action. Each save is a
+        # json.dumps plus a littlefs write of ~400 bytes; doing that per button
+        # press meant several flash writes a second while a user mashed
+        # Food/Play, for at most 15s of extra crash protection. A pending user
+        # action shortens the interval so it isn't left hanging for long.
         self._save_acc += delta
-        if self._save_acc >= 15_000:
+        if self._save_acc >= (3_000 if self._dirty else 15_000):
             self._save_acc = 0.0
+            self._dirty = False
             self._save_state()
 
     def _hourly_tick(self):
@@ -530,7 +659,12 @@ class EMFMon(app.App):
         self.icon.show = False  # clear the home-screen alert; the pet is gone
         self.history.insert(
             0,
-            {"name": pet["name"], "age": pet["age"], "shape": pet["shape"]},
+            {
+                "name": pet["name"],
+                "age": pet["age"],
+                "shape": pet["shape"],
+                "rec": self._archive_battle_records(),
+            },
         )
         self.history = self.history[:20]  # keep the 20 most recent
         self._save_history()
@@ -556,10 +690,13 @@ class EMFMon(app.App):
                     "name": self.pet["name"],
                     "age": self.pet["age"],
                     "shape": self.pet["shape"],
+                    "rec": self._archive_battle_records(),
                 },
             )
             self.history = self.history[:20]
             self._save_history()
+        # a pet that already died was archived (and its record cleared) by
+        # _die(), so there is nothing left to take here.
         self.pet = _new_pet()
         self._anim_type = None
         self.icon.show = False
@@ -567,15 +704,29 @@ class EMFMon(app.App):
 
     # --- input -------------------------------------------------------------
     def _on_button(self, event: ButtonDownEvent):
+        # MUST NOT raise: the eventbus stops the owning app if a handler throws,
+        # which presents as the whole app freezing - buttons dead, pet stopped -
+        # with nothing on screen to say why. battle.py already wraps its handler
+        # for this reason; this one was unprotected, so ANY error on ANY button
+        # path (a bad save, a draw-state slip, an addon import) killed EMFMon.
+        try:
+            self._on_button_inner(event)
+        except Exception as e:
+            print("EMFMon: button error:", e)
+
+    def _on_button_inner(self, event):
         if self.dialog is not None:
             return  # the text dialog owns the buttons while open
         if self.view == "battle":
             return  # Battle registers its own ButtonDownEvent handler (battle.py)
-        if self.view == "menu":
-            return  # the Menu widget handles its own buttons
-        # Ignore the joystick centre press entirely - it's flaky (opens the menu
-        # then instantly selects Rename). LEFT=Menu and C=Heal cover everything.
-        # Checked before CONFIRM because JOYFIRE also carries CONFIRM.
+        if self.arc is not None:
+            self._arc_button(event)   # the overlay owns every button while open,
+            return                    # including CANCEL (closes it, not the app)
+        if self._input_locked():
+            return  # an overlay just closed - don't let its bounce hit the pet
+        # Ignore the joystick centre press on the pet screen - it's flaky (opens
+        # the menu then instantly selects Rename). It IS accepted inside the item
+        # wheel above, where there's nothing destructive for a stray press to hit.
         if JOYSTICK_BUTTON_TYPES["SELECT"] in event.button:
             return
         if BUTTON_TYPES["CANCEL"] in event.button:
@@ -592,12 +743,75 @@ class EMFMon(app.App):
         elif BUTTON_TYPES["RIGHT"] in event.button:
             self._do_action("clean")
         elif BUTTON_TYPES["CONFIRM"] in event.button:
-            # Heal (the C / CONFIRM button); spend an item, but not at full HP
-            if self.pet.get("heals", 0) > 0 and self.pet["health"] < 100:
-                self.pet["heals"] -= 1
-                self._do_action("injection")
+            self._open_inventory()   # C opens the pouch; using is done in there
         elif BUTTON_TYPES["LEFT"] in event.button:
             self._open_menu()
+
+    def _arm_input_lock(self, ms=250):
+        """Ignore pet-screen buttons for `ms` of REAL time. Wall clock, never
+        accumulated delta - a single slow frame would spend a delta budget whole
+        (measured on-badge), which is what defeated the battle lockout."""
+        self._lock_t0 = ticks_ms()
+        self._lock_ms = ms
+
+    def _input_locked(self):
+        return ticks_diff(ticks_ms(), self._lock_t0) < self._lock_ms
+
+    def _arc_button(self, event):
+        """Route a press to the open ArcMenu and act on what it reports."""
+        act = self.arc.button(event)
+        if act is None:
+            return                            # just scrolled
+        self._arm_input_lock()                # the overlay is about to close
+        idx = self.arc.idx
+        # Remember the press we're dispatching: anything opened from here that
+        # subscribes to the eventbus (Battle) is handed this same event
+        # afterwards and must ignore it - see Battle._opened_by.
+        self._arc_event = event
+        on_select, on_back = self._arc_select, self._arc_back
+        # tear down BEFORE dispatching, so a handler can open another menu
+        self.arc = None
+        self._arc_select = self._arc_back = None
+        self.view = "pet"
+        if act == "select":
+            if on_select is not None:
+                on_select(idx)
+        elif on_back is not None:
+            on_back(idx)
+
+    def _has_items(self):
+        """Is the mon carrying anything at all? Allocation-free - safe to call
+        from draw(), unlike _carried_items()."""
+        inv = self.pet.get("inv", {})
+        for i in ITEMS:
+            if inv.get(i, 0) > 0:
+                return True
+        return False
+
+    def _carried_items(self):
+        """Item ids the mon actually has, in ITEMS order. An item at zero isn't
+        shown - an empty wheel is noise, and the HUD already says you have none."""
+        inv = self.pet.get("inv", {})
+        return [i for i in ITEMS if inv.get(i, 0) > 0]
+
+    def _use_item(self, iid):
+        """Spend one of `iid`. Returns True if it was actually consumed."""
+        pet = self.pet
+        spec = ITEMS.get(iid)
+        if spec is None or pet.get("inv", {}).get(iid, 0) <= 0:
+            return False
+        heal = spec.get("heal")
+        if heal is not None:
+            if pet["health"] >= 100:
+                return False      # never burn a restorative at full HP
+            pet["inv"][iid] -= 1
+            pet["health"] = min(100.0, pet["health"] + heal)
+            self._anim_type = "injection"   # the green "+" feedback
+            self._anim_t = 0.0
+            self._dirty = True   # written by the next autosave (<=3s)
+            return True
+        # non-restorative items (buffs) get their branch here when they land
+        return False
 
     def _do_action(self, action):
         pet = self.pet
@@ -610,39 +824,107 @@ class EMFMon(app.App):
             pet["clean_mark"] = pet["clean"]  # re-measure poops from here
         self._anim_type = action  # kick off the feedback animation
         self._anim_t = 0.0
-        self._save_state()
+        self._dirty = True        # written by the next autosave (<=3s)
+
+    _MAIN_MENU = ("Items", "Rename", "History", "Battle", "New pet")
+
+    def _open_arc(self, items, on_select, on_back=None, idx=0,
+                  hint_c="C pick", hint_f="F back", side="right"):
+        """Open a curved overlay menu. on_select(idx)/on_back(idx) are called
+        with the row that was current when it closed; the menu is torn down
+        first, so a handler is free to open another one. `side` should match the
+        button that opened it (LEFT button -> "left")."""
+        m = self.arcmenu               # reconfigured, never reallocated
+        m.set_items(items)
+        m.idx = min(max(0, idx), max(0, len(m.items) - 1))
+        m.hint_c = hint_c
+        m.hint_f = hint_f
+        m.side = side
+        self.arc = m
+        self._arc_select = on_select
+        self._arc_back = on_back
+        self.view = "pet"          # overlays draw ON the pet, never instead
 
     def _open_menu(self):
-        def on_select(value, idx):
-            self._close_menu()
+        def on_select(idx):
+            value = self._MAIN_MENU[idx]
             if value == "Rename":
                 self._rename()
             elif value == "History":
-                self.view = "menu"
                 self._show_history_menu()
+            elif value == "Items":
+                self._open_inventory()
             elif value == "Battle":
                 self._open_battle()
             elif value == "New pet":
                 self._hatch_new()
 
-        self.menu = Menu(
-            self,
-            menu_items=["Rename", "History", "Battle", "New pet", "Back"],
-            select_handler=on_select,
-            back_handler=self._close_menu,
-        )
-        self.view = "menu"
+        # opened by the LEFT button, so it flies out from the left edge
+        self._open_arc(list(self._MAIN_MENU), on_select, side="left")
 
     def _open_battle(self):
         # Battle is an OPTIONAL addon - if it fails to import or construct, the
         # pet must carry on unaffected, so swallow everything and stay on the pet.
         try:
             from .battle import Battle
-            self.battle = Battle(self)
+            self.battle = Battle(self, opened_by=self._arc_event)
             self._battle_draw_errs = 0
             self.view = "battle"
         except Exception as e:
             print("EMFMon: battle unavailable:", e)
+            self.battle = None
+            self.view = "pet"
+
+    def _open_inventory(self):
+        carried = self._carried_items()
+        if not carried:
+            eventbus.emit(ShowNotificationEvent("No items"))
+            return
+        inv = self.pet.get("inv", {})
+
+        def use(idx):
+            self.inv_idx = idx
+            if idx < len(carried):
+                self._use_item(carried[idx])
+
+        self._open_arc(
+            ["%s x%d" % (ITEMS[i]["label"], inv.get(i, 0)) for i in carried],
+            use,
+            # F out of the wheel goes back to the main menu it was opened from,
+            # unless C opened it straight from the pet screen
+            on_back=self._remember_inv_idx,
+            # reopen where they left off, but an item may have been spent since
+            idx=min(self.inv_idx, len(carried) - 1),
+            hint_c="C use",
+        )
+
+    def _remember_inv_idx(self, idx):
+        self.inv_idx = idx
+
+    def _history_label(self, h):
+        """`NAME - 32h`, plus `3W/5L` when that mon has an archived record."""
+        base = "%s - %sh" % (h.get("name", "?"), h.get("age", 0))
+        rec = h.get("rec")
+        if isinstance(rec, dict) and (rec.get("w") or rec.get("l")):
+            base += "  %dW/%dL" % (rec.get("w", 0), rec.get("l", 0))
+        return base
+
+    def _open_battle_records(self, h):
+        # Read-only view of a past mon's record, reusing the battle addon's
+        # ranked-records screen. Same optional-addon rule as _open_battle.
+        try:
+            from .battle import Battle
+            self.battle = Battle(
+                self,
+                records=h["rec"],
+                state="rec_ranked",
+                title=str(h.get("name", "?")),
+                opened_by=self._arc_event,   # same guard as _open_battle
+            )
+            self._battle_draw_errs = 0
+            self.view = "battle"
+        except Exception as e:
+            print("EMFMon: records view unavailable:", e)
             self.battle = None
             self.view = "pet"
 
@@ -657,29 +939,21 @@ class EMFMon(app.App):
 
     def _show_history_menu(self):
         if self.history:
-            items = [
-                f"{h.get('name', '?')} - {h.get('age', 0)}h" for h in self.history
-            ]
+            items = [self._history_label(h) for h in self.history]
         else:
             items = ["No deaths yet"]
-        items.append("Back")
 
-        def on_select(value, idx):
-            self._close_menu()
+        def on_select(idx):
+            # picking a past mon opens its archived battle record; the
+            # placeholder row (empty history) does nothing
+            h = self.history[idx] if idx < len(self.history) else None
+            if h is not None and isinstance(h.get("rec"), dict):
+                self._open_battle_records(h)
 
-        self.menu = Menu(
-            self,
-            menu_items=items,
-            select_handler=on_select,
-            back_handler=self._close_menu,
-        )
-        self.view = "menu"
-
-    def _close_menu(self, *args):
-        if self.menu is not None:
-            self.menu._cleanup()
-            self.menu = None
-        self.view = "pet"
+        # F here steps back to the main menu rather than all the way out, and it
+        # stays on the same side as the menu it came from
+        self._open_arc(items, on_select, on_back=lambda idx: self._open_menu(),
+                       side="left")
 
     def _rename(self):
         self.dialog = TextDialog("Name your pet:", self)
@@ -708,9 +982,8 @@ class EMFMon(app.App):
                 self.overlays = []
                 self.dialog = None
             return True
-        if self.menu is not None:
-            self.menu.update(delta)
-            return True
+        # ArcMenu is pure overlay - it has no update of its own, and the pet
+        # deliberately keeps simulating behind it
         if self.pet["alive"]:
             self._move(delta)
             if self._anim_type is not None:
@@ -760,11 +1033,6 @@ class EMFMon(app.App):
 
         clear_background(ctx)
 
-        if self.view == "menu" and self.menu is not None:
-            self.menu.draw(ctx)
-            ctx.restore()
-            return
-
         if self.pet["alive"]:
             self._draw_poops(ctx)
             self._draw_pet(ctx)
@@ -774,6 +1042,8 @@ class EMFMon(app.App):
             self._draw_dead(ctx)
 
         self._draw_bars(ctx)
+        if self.arc is not None:
+            self.arc.draw(ctx)      # overlay: drawn last, over everything
         ctx.restore()
         self.draw_overlays(ctx)
 
@@ -938,13 +1208,15 @@ class EMFMon(app.App):
         ctx.move_to(-94, 30).text("Menu")        # LEFT   (lower-left)
         ctx.move_to(94, -24).text("Clean")       # RIGHT  (upper-right)
         ctx.move_to(0, 108).text("Play")         # DOWN   (bottom, under bars)
-        # Heal shows how many heal items you have; dimmed when you have none
-        heals = self.pet.get("heals", 0)
-        if heals > 0:
+        # CONFIRM opens the item wheel; dimmed when the pouch is empty.
+        # Deliberately NOT _carried_items() - this runs every frame, and building
+        # a list 60x/s is the allocation pattern that fragmented the heap into an
+        # OOM reboot in _update_searching. Short-circuits on the first item held.
+        if self._has_items():
             set_color(ctx, "label")
         else:
             ctx.rgb(0.4, 0.4, 0.4)
-        ctx.move_to(86, 30).text("Heal x%d" % heals)  # CONFIRM (lower-right)
+        ctx.move_to(86, 30).text("Items")  # CONFIRM (lower-right)
 
     def _draw_dead(self, ctx):
         ctx.text_align = ctx.CENTER
@@ -957,21 +1229,22 @@ class EMFMon(app.App):
         ctx.font_size = 13
         ctx.move_to(0, 20).text("CONFIRM: new pet")
 
+    _BAR_ROWS = (("HP", "health"), ("Food", "food"),
+                 ("Fun", "fun"), ("Clean", "clean"))
+
     def _draw_bars(self, ctx):
         ctx.text_align = ctx.LEFT
         ctx.text_baseline = ctx.MIDDLE
         ctx.font_size = 11
-        rows = (
-            ("HP", self.pet["health"]),
-            ("Food", self.pet["food"]),
-            ("Fun", self.pet["fun"]),
-            ("Clean", self.pet["clean"]),
-        )
+        pet = self.pet
         bw, bh = 44, 7          # bar size (shorter, to leave room for words)
         lx = -60                # label x (full words, left-aligned)
         x0 = -22                # bar x
         y0 = 56
-        for i, (label, val) in enumerate(rows):
+        # _BAR_ROWS is a class constant: this runs every frame on the always-on
+        # screen, and rebuilding the row tuples here allocated 5 objects a frame
+        for i, (label, key) in enumerate(self._BAR_ROWS):
+            val = pet[key]
             y = y0 + i * 12
             set_color(ctx, "label")
             ctx.move_to(lx, y + bh / 2).text(label)

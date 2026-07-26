@@ -47,6 +47,8 @@ try:
 except Exception:  # pragma: no cover - always present on-badge
     random = None
 
+from .arcmenu import ArcMenu, draw_hints, pulse_k, ticks_diff, ticks_ms
+
 try:
     from .ble_link import BleLink
     _HAVE_BLE = True
@@ -178,6 +180,28 @@ def _draw_mon(ctx, x, y, s, shape, colour, fainted=False):
             ctx.rgb(0, 0, 0).arc(x + sx, ey, s * 0.09, 0, 2 * math.pi, False).fill()
 
 
+def blank_records():
+    """A fresh, empty record - what a newly hatched mon starts with."""
+    return {"w": 0, "l": 0, "log": [], "pw": 0, "pl": 0}
+
+
+def archive_records():
+    """Take the current mon's battle record and clear the file for the next one.
+
+    Records used to be global: battles.json was never reset, so a new mon
+    inherited its predecessor's W/L and opponent log. Now app.py calls this when
+    a mon dies or is replaced, stores the returned snapshot on the history entry,
+    and the successor starts from zero.
+    """
+    rec = _load_records()
+    try:
+        with open(BATTLES_PATH, "w") as f:
+            f.write(json.dumps(blank_records()))
+    except Exception as e:
+        print("Battle: reset records failed:", e)
+    return rec
+
+
 def _load_records():
     try:
         with open(BATTLES_PATH) as f:
@@ -197,7 +221,7 @@ def _load_records():
             "pl": max(0, int(data.get("pl", 0))),    # practice losses
         }
     except Exception:
-        return {"w": 0, "l": 0, "log": [], "pw": 0, "pl": 0}
+        return blank_records()
 
 
 class Battle:
@@ -207,23 +231,51 @@ class Battle:
             invited | handshaking | anim | result.
     """
 
-    def __init__(self, app):
+    def __init__(self, app, records=None, state="menu", title=None,
+                 opened_by=None):
         self.app = app
         self.done = False
-        self.records = _load_records()
+        # `records` set = read-only view of a PAST mon's archived record, opened
+        # from Menu -> History. It never loads or writes battles.json, and
+        # CANCEL closes the view outright instead of walking back up our menus.
+        self.archived = records is not None
+        self.records = records if self.archived else _load_records()
+        self.rec_title = title     # past mon's name, shown instead of "Ranked"
         self.menu_items = ("Practice", "Find opponent", "Records", "Back")
         self.menu_idx = 0
         self.rec_items = ("Ranked", "Practice", "Back")
         self.rec_idx = 0
         self.rec_scroll = 0        # scroll offset in the ranked opponent log
+        # List screens render through the app's single shared ArcMenu. _arc_state
+        # is the state its contents were last loaded for, so set_items() runs
+        # once per transition and NEVER per frame (a per-frame list rebuild is
+        # what fragmented the heap in _update_searching - see peer_list()).
+        self._arc_state = None
+        self._own_arc = None       # only used if the app has no arcmenu
         self.message = ""
-        self.state = "menu"
+        self.state = state
         # per-battle
         self.opp = None            # {"name","shape","colour","strength","id"}
         self.i_won = False
         self.is_practice = False   # practice is free: no HP change, no W/L
         self.my_str = 5            # OWN strength, snapshotted per battle
-        self._input_lock = 0.0     # brief button lockout after arriving at a menu
+        # The press that opened us is still in flight: we subscribe our own
+        # ButtonDownEvent handler below, and the eventbus delivers that same
+        # press to it afterwards. Left alone it lands on the fresh menu and
+        # instantly picks row 0 (Practice).
+        #
+        # This CANNOT be solved with a timer: the press arrives after the first
+        # update(), and that update carries a large delta (building this object
+        # + its BLE link), so a lockout counted in deltas is already spent. We
+        # ignore the event OBJECT itself - exact, no window to tune.
+        self._opened_by = opened_by
+        # Screen-change lockout, measured in WALL CLOCK, not accumulated delta.
+        # It used to be decremented by update()'s delta and was observed on-badge
+        # draining a full 250ms in a single frame, which let a double-tap blow
+        # straight through whatever screen had just appeared (Records->Practice
+        # flashing back out, gate-reason screens flashing past).
+        self._lock_t0 = ticks_ms()
+        self._lock_ms = 250
         self.anim_t = 0.0
         self.my_bar = 100.0
         self.opp_bar = 100.0
@@ -234,8 +286,21 @@ class Battle:
         # will use the real BLE address). Random per session is fine.
         self._own_id = bytes(random.getrandbits(8) for _ in range(6))
         # BLE discovery
-        self.ble = BleLink(self._my_name()) if _HAVE_BLE else None
+        # an archived record is a static screen - it never discovers or fights,
+        # so it has no business holding a BLE link
+        self.ble = BleLink(self._my_name()) if (_HAVE_BLE and not self.archived) else None
         self._peers = []           # cached closest-first list while searching
+        # Pre-rendered visible rows for the search screen. Built only when the
+        # peer list or the selection actually changes - the draw path used to
+        # slice the list and concatenate a label per row EVERY frame, which is
+        # the allocation pattern that fragmented the heap here before.
+        self._peer_rows = []
+        self._peer_rows_dirty = True
+        # same treatment for the ranked-records screen
+        self._rec_rows = []
+        self._rec_head = ("0W", "0L")
+        self._rec_foot = None
+        self._rec_rows_dirty = True
         self.peer_idx = 0
         self._search_t = 0.0
         self._peer_refresh = 0.0   # throttle peer_list() (it allocates - fragments)
@@ -249,6 +314,16 @@ class Battle:
         # rather than relying on EMFMon delegating - held ref so we can remove it.
         self._input_handler = self._handle_input
         eventbus.on_async(ButtonDownEvent, self._input_handler, self.app)
+
+    # --- input lockout -----------------------------------------------------
+    def _arm_input_lock(self, ms=250):
+        """Ignore buttons for `ms` of REAL time. Wall clock, not accumulated
+        delta: a single slow frame used to spend the whole budget at once."""
+        self._lock_t0 = ticks_ms()
+        self._lock_ms = ms
+
+    def _input_locked(self):
+        return ticks_diff(ticks_ms(), self._lock_t0) < self._lock_ms
 
     # --- input handler (own eventbus registration) -------------------------
     async def _handle_input(self, event):
@@ -380,6 +455,11 @@ class Battle:
         rec["log"].insert(0, {
             "o": self.opp.get("name", "???") if self.opp else "???",
             "r": "W" if self.i_won else "L",
+            # OUR pet's age in hours at the moment of the fight, so a trainer can
+            # see how young their mon was when it took a scalp. Not a wall-clock
+            # date: the badge RTC is never NTP-synced outside an OTA check, so
+            # time.localtime() reads 2000-01-01 and a real date would be a lie.
+            "a": int(pet.get("age", 0)),
         })
         rec["log"] = rec["log"][:MAX_LOG]
         self._save_records()
@@ -389,6 +469,8 @@ class Battle:
             print("Battle: save pet failed:", e)
 
     def _save_records(self):
+        if self.archived:
+            return  # a past mon's record is history: never write it back
         try:
             with open(BATTLES_PATH, "w") as f:
                 f.write(json.dumps(self.records))
@@ -401,6 +483,8 @@ class Battle:
         self._search_t = 0.0
         self._peer_refresh = 0.0
         self._peers = []
+        self._peer_rows = []
+        self._peer_rows_dirty = True
         self._decline_addr = None    # fresh session: don't carry a stale suppress
         self._decline_ms = 0.0
         if self.ble is not None:
@@ -414,8 +498,7 @@ class Battle:
 
     # --- update ------------------------------------------------------------
     def update(self, delta):
-        if self._input_lock > 0.0:
-            self._input_lock = max(0.0, self._input_lock - delta)
+        # (the input lockout is wall-clock now - nothing to tick down here)
         st = self.state
         if st == "searching":
             self._update_searching(delta)
@@ -446,6 +529,7 @@ class Battle:
                     if p.get("addr") == sel_addr:
                         self.peer_idx = i
                         break
+            self._peer_rows_dirty = True
             gc.collect()                          # keep the heap tidy
         n = len(self._peers)
         if self.peer_idx >= n:
@@ -497,8 +581,15 @@ class Battle:
     def on_button(self, event):
         # NB: unlike the pet view we do NOT ignore the joystick centre here - in
         # a plain menu it's a perfectly good CONFIRM (JOYFIRE carries CONFIRM).
-        if self._input_lock > 0.0:
-            return  # brief lockout after arriving at a menu (anti double-tap)
+        if self._opened_by is not None:
+            # only ever true for the very first press we are handed; if the
+            # opening press was never re-delivered, this simply clears itself
+            was_opener = event is self._opened_by
+            self._opened_by = None
+            if was_opener:
+                return
+        if self._input_locked():
+            return  # brief lockout after arriving at a screen (anti double-tap)
         st = self.state
         if st == "menu":
             self._menu_button(event)
@@ -510,14 +601,14 @@ class Battle:
             if BUTTON_TYPES["CANCEL"] in event.button:
                 self._abort_handshake("Cancelled")
         elif st == "info":
-            if _any_button(event):  # terminal screen - any key dismisses
+            if BUTTON_TYPES["CANCEL"] in event.button:
                 self.state = "menu"
         elif st == "records":
             self._records_button(event)
         elif st == "rec_ranked":
             self._rec_ranked_button(event)
         elif st == "rec_practice":
-            if _any_button(event):
+            if BUTTON_TYPES["CANCEL"] in event.button:
                 self.state = "records"
         elif st == "anim":
             # Practice battles can be skipped; a networked one (later) must play
@@ -525,7 +616,7 @@ class Battle:
             if self.is_practice and BUTTON_TYPES["CANCEL"] in event.button:
                 self._finish_anim()
         elif st == "result":
-            if _any_button(event):
+            if BUTTON_TYPES["CANCEL"] in event.button:
                 self.opp = None
                 self.state = "menu"
         # Whenever a button just moved us to a NEW screen, briefly ignore input
@@ -533,7 +624,7 @@ class Battle:
         # the screen we just landed on. This is what makes the gate-reason info
         # screen ("must be fully healed", etc) linger instead of flashing past.
         if self.state != st:
-            self._input_lock = 250.0
+            self._arm_input_lock()
 
     def _finish_anim(self):
         # snap bars/flash to their final state and apply the result exactly once
@@ -546,15 +637,54 @@ class Battle:
         self._apply_result()
         self.state = "result"
 
+    # --- shared curved menu ------------------------------------------------
+    _ARC_HINT_C = "C pick"
+
+    def _arc(self):
+        """The app's one ArcMenu. Falls back to our own if the host app doesn't
+        provide one, so battle.py stays a self-contained optional addon."""
+        m = getattr(self.app, "arcmenu", None)
+        if m is None:
+            if self._own_arc is None:
+                self._own_arc = ArcMenu()
+            m = self._own_arc
+        return m
+
+    @staticmethod
+    def _visible(items):
+        """Drop a trailing 'Back' row - F backs out, as in every other menu."""
+        return list(items[:-1]) if items and items[-1] == "Back" else list(items)
+
+    def _sync_arc(self):
+        """Load the current list-state into the shared menu. Guarded by
+        _arc_state so it runs once per transition, never per frame."""
+        st = self.state
+        if st == self._arc_state:
+            return
+        if st == "menu":
+            src, idx = self.menu_items, self.menu_idx
+        elif st == "records":
+            src, idx = self.rec_items, self.rec_idx
+        else:
+            self._arc_state = st
+            return
+        m = self._arc()
+        m.set_items(self._visible(src))
+        m.idx = min(max(0, idx), max(0, len(m.items) - 1))
+        m.side = "left"
+        m.hint_c = self._ARC_HINT_C
+        m.hint_f = "F back"
+        self._arc_state = st
+
     def _menu_button(self, event):
-        if BUTTON_TYPES["CANCEL"] in event.button:
+        self._sync_arc()
+        m = self._arc()
+        act = m.button(event)
+        self.menu_idx = m.idx
+        if act == "back":
             self.done = True
-        elif BUTTON_TYPES["UP"] in event.button:
-            self.menu_idx = (self.menu_idx - 1) % len(self.menu_items)
-        elif BUTTON_TYPES["DOWN"] in event.button:
-            self.menu_idx = (self.menu_idx + 1) % len(self.menu_items)
-        elif BUTTON_TYPES["CONFIRM"] in event.button:
-            self._menu_select(self.menu_items[self.menu_idx])
+        elif act == "select":
+            self._menu_select(m.items[m.idx])
 
     def _menu_select(self, item):
         if item == "Practice":
@@ -573,8 +703,7 @@ class Battle:
         elif item == "Records":
             self.rec_idx = 0
             self.state = "records"
-        elif item == "Back":
-            self.done = True
+        # NB: no "Back" branch - _visible() strips that row, F backs out instead.
 
     def _searching_button(self, event):
         peers = self._peers
@@ -583,9 +712,11 @@ class Battle:
         elif BUTTON_TYPES["UP"] in event.button:
             if peers:
                 self.peer_idx = (self.peer_idx - 1) % len(peers)
+                self._peer_rows_dirty = True
         elif BUTTON_TYPES["DOWN"] in event.button:
             if peers:
                 self.peer_idx = (self.peer_idx + 1) % len(peers)
+                self._peer_rows_dirty = True
         elif BUTTON_TYPES["CONFIRM"] in event.button:
             if peers:
                 peer = peers[self.peer_idx % len(peers)]
@@ -718,31 +849,37 @@ class Battle:
     _REC_ROWS = 6  # ranked-log rows visible at once
 
     def _records_button(self, event):
-        if BUTTON_TYPES["CANCEL"] in event.button:
+        self._sync_arc()
+        m = self._arc()
+        act = m.button(event)
+        self.rec_idx = m.idx
+        if act == "back":
             self.state = "menu"
-        elif BUTTON_TYPES["UP"] in event.button:
-            self.rec_idx = (self.rec_idx - 1) % len(self.rec_items)
-        elif BUTTON_TYPES["DOWN"] in event.button:
-            self.rec_idx = (self.rec_idx + 1) % len(self.rec_items)
-        elif BUTTON_TYPES["CONFIRM"] in event.button:
-            sel = self.rec_items[self.rec_idx]
+        elif act == "select":
+            sel = m.items[m.idx]
             if sel == "Ranked":
                 self.rec_scroll = 0
+                self._rec_rows_dirty = True
                 self.state = "rec_ranked"
             elif sel == "Practice":
                 self.state = "rec_practice"
-            else:  # Back
-                self.state = "menu"
 
     def _rec_ranked_button(self, event):
         log = self.records.get("log", [])
         max_scroll = max(0, len(log) - self._REC_ROWS)
         if BUTTON_TYPES["CANCEL"] in event.button:
-            self.state = "records"
+            if self.archived:
+                # opened straight into this screen from the History menu, so
+                # there is no records menu behind it - close the view instead
+                self.done = True
+            else:
+                self.state = "records"
         elif BUTTON_TYPES["UP"] in event.button:
             self.rec_scroll = max(0, self.rec_scroll - 1)
+            self._rec_rows_dirty = True
         elif BUTTON_TYPES["DOWN"] in event.button:
             self.rec_scroll = min(max_scroll, self.rec_scroll + 1)
+            self._rec_rows_dirty = True
 
     # --- drawing -----------------------------------------------------------
     def draw(self, ctx):
@@ -767,22 +904,36 @@ class Battle:
         elif st in ("anim", "result"):
             self._draw_battle(ctx)
 
+    _TITLE_RGB = (0.95, 0.18, 0.18)   # red, pulsing on the shared heartbeat
+    _RING_RGB = (0.85, 0.12, 0.12)
+    _RING_W = 3                       # stroke width, px
+    _RING_R = 120 - _RING_W / 2 - 1   # centre it just inside the bezel
+
+    def _draw_ring(self, ctx):
+        """Red rim around the screen edge - frames battle mode. Drawn AFTER the
+        menu so the scrim doesn't dim it."""
+        ctx.line_width = self._RING_W
+        ctx.rgb(*self._RING_RGB)
+        ctx.begin_path()
+        ctx.arc(0, 0, self._RING_R, 0, 2 * math.pi, False)
+        ctx.stroke()
+
     def _draw_menu(self, ctx):
+        self._sync_arc()
+        m = self._arc()
+        m.draw(ctx, hint=False)      # first: it lays down the scrim
+        self._draw_ring(ctx)
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
-        set_color(ctx, "label")
         ctx.font_size = 20
-        ctx.move_to(0, -70).text("Battle!")
-        ctx.font_size = 15
-        for i, item in enumerate(self.menu_items):
-            y = -26 + i * 24
-            if i == self.menu_idx:
-                ctx.rgb(0.9, 0.7, 0.1).move_to(0, y).text("> " + item + " <")
-            else:
-                set_color(ctx, "label")
-                ctx.move_to(0, y).text(item)
-        ctx.font_size = 11
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 96).text("A/D move  C pick  F back")
+        k = pulse_k()                # same cadence as the selected menu row
+        r, g, b = self._TITLE_RGB
+        ctx.rgb(r * k, g * k, b * k)
+        # stacked and centred: two short lines fit the narrow top of the circle
+        # far better than one wide one, and clear the first menu row at y=-56
+        ctx.move_to(0, -104).text("Battle")
+        ctx.move_to(0, -80).text("Mode")
+        m.draw_hint(ctx)             # last: the call-outs sit over the rim
 
     def _draw_info(self, ctx):
         ctx.text_align = ctx.CENTER
@@ -792,56 +943,76 @@ class Battle:
         lines = self.message.split("\n")
         for i, line in enumerate(lines):
             ctx.move_to(0, -20 + i * 22).text(line)
-        ctx.font_size = 12
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 90).text("any key")
+        draw_hints(ctx, f="F back")
 
     def _draw_records(self, ctx):
+        self._sync_arc()
+        m = self._arc()
+        m.draw(ctx, hint=False)      # first: it lays down the scrim
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         set_color(ctx, "label")
         ctx.font_size = 19
-        ctx.move_to(0, -70).text("Records")
-        ctx.font_size = 16
-        for i, item in enumerate(self.rec_items):
-            y = -20 + i * 26
-            if i == self.rec_idx:
-                ctx.rgb(0.9, 0.7, 0.1).move_to(0, y).text("> " + item + " <")
-            else:
-                set_color(ctx, "label")
-                ctx.move_to(0, y).text(item)
-        ctx.font_size = 11
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 96).text("A/D move  C pick  F back")
+        ctx.move_to(0, -96).text("Records")
+        m.draw_hint(ctx)             # last: the call-outs stay on top
+
+    def _build_rec_rows(self):
+        """Pre-render the ranked screen's strings. Records are immutable while
+        it's open, so this runs on entry and on scroll - not 60x/s."""
+        log = self.records.get("log", [])
+        start = min(self.rec_scroll, max(0, len(log) - self._REC_ROWS))
+        rows = []
+        for e in log[start:start + self._REC_ROWS]:
+            won = e.get("r") == "W"
+            age = e.get("a")
+            rows.append((
+                ("W vs " if won else "L vs ") + str(e.get("o", "???")),
+                ("%dh" % age) if isinstance(age, int) else None,
+                won,
+            ))
+        self._rec_rows = rows
+        self._rec_head = ("%dW" % self.records.get("w", 0),
+                          "%dL" % self.records.get("l", 0))
+        self._rec_foot = None
+        if len(log) > self._REC_ROWS:
+            self._rec_foot = "A/D scroll  %d-%d/%d" % (
+                start + 1, min(len(log), start + self._REC_ROWS), len(log))
+        self._rec_rows_dirty = False
 
     def _draw_rec_ranked(self, ctx):
+        if self._rec_rows_dirty:
+            self._build_rec_rows()
         ctx.text_align = ctx.CENTER
         ctx.text_baseline = ctx.MIDDLE
         set_color(ctx, "label")
         ctx.font_size = 17
-        ctx.move_to(0, -96).text("Ranked")
+        ctx.move_to(0, -96).text(self.rec_title or "Ranked")
         ctx.font_size = 22
-        ctx.rgb(0.2, 0.8, 0.35).move_to(-30, -70).text("%dW" % self.records.get("w", 0))
-        ctx.rgb(0.9, 0.25, 0.25).move_to(30, -70).text("%dL" % self.records.get("l", 0))
+        ctx.rgb(0.2, 0.8, 0.35).move_to(-30, -70).text(self._rec_head[0])
+        ctx.rgb(0.9, 0.25, 0.25).move_to(30, -70).text(self._rec_head[1])
         ctx.font_size = 13
-        log = self.records.get("log", [])
-        if not log:
+        if not self._rec_rows:
             set_color(ctx, "label")
             ctx.move_to(0, -6).text("No ranked fights yet")
         else:
-            start = min(self.rec_scroll, max(0, len(log) - self._REC_ROWS))
-            for row, e in enumerate(log[start:start + self._REC_ROWS]):
-                won = e.get("r") == "W"
+            for row, (main, age_s, won) in enumerate(self._rec_rows):
+                y = -44 + row * 18
+                ctx.font_size = 13   # reset: the age suffix below shrinks it
                 ctx.rgb(*((0.2, 0.8, 0.35) if won else (0.9, 0.25, 0.25)))
-                tag = "W vs " if won else "L vs "
-                ctx.move_to(0, -44 + row * 18).text(tag + str(e.get("o", "???")))
-            if len(log) > self._REC_ROWS:
+                ctx.move_to(0, y).text(main)
+                # our mon's age at the time, tucked in small + grey after the
+                # result. Rows are CENTER-aligned, so offset by half of each
+                # string's width to butt it up against the right edge of main.
+                if age_s is not None:
+                    mw = ctx.text_width(main)
+                    ctx.font_size = 10
+                    ctx.rgb(0.55, 0.55, 0.55)
+                    ctx.move_to(mw / 2 + 4 + ctx.text_width(age_s) / 2,
+                                y).text(age_s)
+            if self._rec_foot is not None:
                 ctx.font_size = 11
-                ctx.rgb(0.6, 0.6, 0.6).move_to(0, 78).text(
-                    "A/D scroll  %d-%d/%d" % (start + 1,
-                                              min(len(log), start + self._REC_ROWS),
-                                              len(log))
-                )
-        ctx.font_size = 11
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 100).text("F back")
+                ctx.rgb(0.6, 0.6, 0.6).move_to(0, 78).text(self._rec_foot)
+        draw_hints(ctx, f="F back")
 
     def _draw_rec_practice(self, ctx):
         ctx.text_align = ctx.CENTER
@@ -859,8 +1030,28 @@ class Battle:
         ctx.font_size = 14
         set_color(ctx, "label")
         ctx.move_to(0, 44).text("wins - losses")
-        ctx.font_size = 11
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 100).text("any key")
+        draw_hints(ctx, f="F back")
+
+    def _build_peer_rows(self):
+        """Pre-render the visible 5-row window: label, signal level, selected.
+        Called on a peer refresh (<=2.5/s) or a selection move - never per frame.
+        """
+        peers = self._peers
+        start = 0
+        if len(peers) > 5:
+            # keep the highlighted peer inside the window
+            start = min(max(0, self.peer_idx - 2), len(peers) - 5)
+        rows = []
+        for row in range(start, min(start + 5, len(peers))):
+            peer = peers[row]
+            sel = row == self.peer_idx
+            rows.append((
+                ("> " if sel else "   ") + peer["name"],
+                _signal_level(peer.get("rssi")),
+                sel,
+            ))
+        self._peer_rows = rows
+        self._peer_rows_dirty = False
 
     def _draw_searching(self, ctx):
         ctx.text_align = ctx.CENTER
@@ -870,10 +1061,6 @@ class Battle:
         ctx.move_to(0, -96).text("Find opponent")
         ctx.font_size = 11
         ctx.rgb(0.35, 0.55, 0.95).move_to(0, -78).text("via Bluetooth")
-        # TEMP diagnostic: free heap in KB - watch if it declines (leak) or
-        # holds then reboots (fragmentation)
-        ctx.font_size = 9
-        ctx.rgb(0.45, 0.45, 0.5).move_to(0, -64).text("mem %dk" % (gc.mem_free() // 1024))
         peers = self._peers
         if not peers:
             ctx.font_size = 14
@@ -886,28 +1073,22 @@ class Battle:
                     ("No badges nearby.", "They must also be", "in 'Find opponent'.")
                 ):
                     ctx.move_to(0, 6 + i * 18).text(line)
-            ctx.font_size = 11
-            ctx.rgb(0.6, 0.6, 0.6).move_to(0, 98).text("F: back")
+            draw_hints(ctx, f="F back")
         else:
-            # scroll a 5-row window so the highlighted peer is always visible
-            start = 0
-            if len(peers) > 5:
-                start = min(max(0, self.peer_idx - 2), len(peers) - 5)
-            for row, peer in enumerate(peers[start:start + 5]):
-                idx = start + row
+            if self._peer_rows_dirty:
+                self._build_peer_rows()
+            for row, (label, level, sel) in enumerate(self._peer_rows):
                 y = -48 + row * 22
-                sel = idx == self.peer_idx
                 ctx.text_align = ctx.LEFT
                 ctx.font_size = 14
                 if sel:
                     ctx.rgb(0.9, 0.7, 0.1)
                 else:
                     set_color(ctx, "label")
-                ctx.move_to(-56, y).text(("> " if sel else "   ") + peer["name"])
-                _draw_signal_bars(ctx, 42, y, _signal_level(peer.get("rssi")))
+                ctx.move_to(-56, y).text(label)
+                _draw_signal_bars(ctx, 42, y, level)
             ctx.text_align = ctx.CENTER
-            ctx.font_size = 11
-            ctx.rgb(0.6, 0.6, 0.6).move_to(0, 98).text("C: challenge   F: back")
+            draw_hints(ctx, c="C fight", f="F back")
 
     def _draw_invited(self, ctx):
         ctx.text_align = ctx.CENTER
@@ -996,20 +1177,13 @@ class Battle:
         else:
             hp = WIN_HEALTH if self.i_won else LOSE_HEALTH
             ctx.move_to(0, 24).text("HP -> %d" % int(hp))
-        ctx.rgb(0.6, 0.6, 0.6).move_to(0, 100).text("any key")
+        draw_hints(ctx, f="F back")
 
 
 # --- module helpers --------------------------------------------------------
 def _clamp01(v):
     return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
-
-def _any_button(event):
-    b = event.button
-    return any(
-        BUTTON_TYPES[k] in b
-        for k in ("UP", "DOWN", "LEFT", "RIGHT", "CONFIRM", "CANCEL")
-    )
 
 
 def _signal_level(rssi):

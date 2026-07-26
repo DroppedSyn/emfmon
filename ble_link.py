@@ -262,6 +262,15 @@ class BleLink:
             import bluetooth
             b = bluetooth.BLE()
             b.active(True)
+            # active(True) RESETS the GATT DB to defaults on this firmware (see
+            # TEST/badge_peer.py), so any battle service registered by an
+            # earlier invite is GONE as of this call. _gatt_ready is sticky, so
+            # without clearing it _ensure_gatt() would no-op and the next invite
+            # would advertise with an empty GATT table - the peer connects, finds
+            # no 0xF00E, and both sides sit there until the exchange times out.
+            # Hit on the SECOND search of a session (the first registers after
+            # this call), and it stays broken until reboot.
+            self._gatt_ready = False
             v = b.config("mac")
             # config('mac') returns (addr_type, addr) on the badge.
             a = v[1] if isinstance(v, tuple) else v
