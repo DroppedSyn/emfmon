@@ -55,6 +55,22 @@ def _seed_rng():
         seed ^= b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
     except Exception:
         pass
+    # A per-badge constant, and the only source here that cannot go missing or
+    # come up empty. It carries no per-BOOT entropy so it does not replace the
+    # two above; what it guarantees is that if those both fail the badges still
+    # diverge from EACH OTHER instead of all hatching one shared pet.
+    try:
+        import machine
+        for i, byte in enumerate(machine.unique_id()):
+            seed ^= byte << ((i % 4) * 8)
+    except Exception:
+        pass
+    # Belt and braces. Seed 0 is a DEGENERATE state for MicroPython's PRNG
+    # rather than merely a boring one: measured on a Tildagon, random.seed(0)
+    # makes the shape draw come out SHAPES[0] - a square - every single time.
+    # Only reachable now if all three sources above failed.
+    if seed == 0:
+        seed = 0x9E3779B9
     try:
         random.seed(seed & 0xFFFFFFFF)
     except Exception:
