@@ -6,11 +6,15 @@ Your pet is a randomly-coloured shape — one of eight (square, triangle, circle
 diamond, pentagon, hexagon, octagon or star) — born with its own **personality**.
 It hatches as a tiny dot and **grows with your badge over time**, evolving through
 life stages (baby → child → adult → crowned elder) while it wanders the screen and
-four needs — **Health, Food, Fun, Clean** — slowly drain. Keep it fed, entertained,
-clean and healthy, or it might not make it.
+three needs — **Food, Fun, Clean** — slowly drain. **Health** doesn't drain on its
+own; it suffers when you let the other three run empty. Keep it fed, entertained
+and clean, or it might not make it.
 
 It runs in the **background**, so your pet keeps living (and needing you) even while
 you're using other apps on the badge.
+
+> 📖 **[Read the full manual](emfmon_manual.md)** for every number — exact decay
+> rates, health-tick damage, death odds, and how long a neglected pet really has.
 
 ## Controls
 
@@ -19,11 +23,16 @@ you're using other apps on the badge.
 | **UP** | Food |
 | **DOWN** | Play |
 | **RIGHT** | Clean |
-| **LEFT** | Menu (rename / history / new pet) |
-| **CONFIRM** (C button) | Heal — spends a heal item |
+| **LEFT** | Menu — Items / Battle / History / Rename / New pet |
+| **CONFIRM** (C button) | Open your item pouch — pick and use an item in there |
 | **CANCEL** | Exit |
 
-The joystick's up/down/left/right mirror the corner buttons.
+The joystick's up/down/left/right mirror the corner buttons. The joystick **centre
+press is ignored on the pet screen** (it was flaky enough to open the menu and
+instantly pick Rename), but works inside the item pouch.
+
+CONFIRM doesn't heal directly — it opens the pouch, so a stray press can't burn a
+heal item.
 
 ## Needs & health
 
@@ -32,10 +41,13 @@ Your pet has four stats, all 0–100 (higher is better), shown as bars:
 - **Food**, **Fun**, **Clean** drain in real time — roughly empty in **~10 / ~15 /
   ~20 minutes** respectively from full. Top each one up with its button.
 - A need below **25%** turns its bar **red** and starts hurting **Health**.
-- **Health** doesn't drain on its own. On a periodic health check it **drops** while
-  any need is in the red, and slowly **recovers** while the pet is well looked after
-  (all needs at 50%+). If Health falls low, the pet risks **dying** — so don't let
-  needs sit red for long.
+- **Health** doesn't drain on its own. On a periodic health check it **drops by
+  10 per need that's in the red** — so one slipped need costs 10, but letting all
+  three go costs **30 a tick**. Neglect compounds. It slowly **recovers** (+6)
+  while the pet is well looked after (all needs at 50%+).
+- Health hitting **0 doesn't kill your pet** — below 20 it's rolled at **10% every
+  20 minutes**, so there's usually time to rescue it. A typical adult survives
+  around **4 hours** of unbroken neglect before the odds turn against it.
 - The pet's **face reacts to its mood**: it smiles when happy, frowns when a need is
   low, and shows `X_X` when Health is critical.
 
@@ -81,8 +93,10 @@ Greedy one mellows with age.
 
 - **Poop**: your pet leaves a brown dot each time it gets a bit dirtier. The **Clean**
   action wipes them all away.
-- **Heal inventory**: you gain **one heal item every 30 minutes** (stored up to a cap).
-  Spend one with the **C button** to top up Health — but not while already at full HP.
+- **Heal inventory**: you gain **two Small Heals every 30 minutes** of on-time,
+  **+15 Health** each, stored up to 30. Open the pouch with **C** and use one — the
+  game refuses rather than wastes it if you're already at full HP. Bigger heals
+  exist in the game but have no source yet.
 - **`mon!` tag**: a persistent alert appears on the home screen when a need is getting
   low, even while EMFMon is in the background, so you know when to check in.
 - **History**: past pets are remembered — their name, shape, and how old they got.
@@ -95,8 +109,8 @@ off.
 
 ## Battles (Menu → Battle)
 
-Your pet can **fight other badges** over the badge's ESP-NOW radio — no WiFi network
-needed, just two badges near each other.
+Your pet can **fight other badges** over **Bluetooth LE** — no WiFi, no network, no
+pairing. Just two badges near each other.
 
 - **Find opponent** — your badge lists nearby EMFMon players; pick one and send an
   invite, and they get to **accept or decline**. Once both agree, the mons trade shots
@@ -110,9 +124,12 @@ needed, just two badges near each other.
 - **Strength** is a mostly-hidden stat: pets are born middling and it **creeps up the
   longer you keep them healthy**, so a well-cared-for pet fights a little better.
 
-To battle, your pet must be an **adult (6h+)** and at **full health**. Both badges need
-to be on the **same WiFi (or both with WiFi off)** so their radios share a channel — if
-they can't find each other the screen will tell you what to check.
+To battle, your pet must be alive, an **adult (6h+)** and at **full health** — this
+applies to **Practice too**, so a battered pet can't spar either.
+
+There's no WiFi requirement: BLE advertises on fixed channels every badge listens
+on. (Earlier versions used ESP-NOW, which followed each badge's WiFi association
+and so struggled to find peers in a crowd — that's exactly why it was replaced.)
 
 ## Licence
 
